@@ -6,14 +6,14 @@ Each method is a function ``fn(ctx) -> MethodResult``. A result is one of:
   * na      — needs data no uploaded document / free feed provides
 
 Methods that yield a per-share fair value set ``intrinsic_ps`` so the engine can
-triangulate a single intrinsic value. All monetary inputs are in the report's
-reporting currency, in millions unless noted.
+triangulate a single intrinsic value. All monetary inputs reach a method already
+converted to the target currency (AUD by default) and expressed in millions
+unless noted; per-share values are in target currency per share.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Optional
 
 
 @dataclass
@@ -22,11 +22,11 @@ class MethodResult:
     section: str
     name: str
     status: str = "na"                 # ok | partial | na
-    value: Optional[float] = None
+    value: float | None = None
     unit: str = ""
     note: str = ""
     missing: list[str] = field(default_factory=list)
-    intrinsic_ps: Optional[float] = None
+    intrinsic_ps: float | None = None
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -35,59 +35,87 @@ class MethodResult:
 # --------------------------------------------------------------------------- #
 #  Context                                                                     #
 # --------------------------------------------------------------------------- #
-def _g(d: dict, k: str) -> Optional[float]:
+def _g(d: dict, k: str) -> float | None:
+    """Read a numeric field value from a merged fundamentals dict (or None)."""
     v = d.get(k)
     if isinstance(v, dict):
         v = v.get("value")
     return float(v) if isinstance(v, (int, float)) else None
 
 
-class Ctx:
-    """Normalised inputs derived from OCR fundamentals + market snapshot."""
+def _cvt(v: float | None, fx: float) -> float | None:
+    """Apply an FX multiplier to a monetary value, preserving None."""
+    return None if v is None else v * fx
 
-    def __init__(self, fundamentals: dict, market: dict | None, currency: str = "USD",
+
+class Ctx:
+    """Normalised inputs derived from OCR fundamentals + market snapshot.
+
+    All monetary inputs are converted into the ``currency`` (default AUD) using
+    ``fx`` (units of target per unit of the report's reporting currency) so that
+    every downstream figure — intrinsic value, multiples, the price comparison —
+    is expressed in one currency. Rates, ratios and share counts are never
+    scaled by FX.
+    """
+
+    def __init__(self, fundamentals: dict, market: dict | None, currency: str = "AUD",
+                 reporting_currency: str | None = None, fx: float = 1.0, fx_live: bool = True,
                  g_high: float = 0.05, g_term: float = 0.025, horizon: int = 5):
         f = fundamentals or {}
         m = market or {}
-        self.currency = currency
+        self.currency = currency                       # target/display currency
+        self.reporting_currency = reporting_currency or currency
+        self.fx = fx if fx else 1.0                    # reporting_currency -> currency
         self.g_high = g_high
         self.g_term = g_term
         self.horizon = horizon
         self.assumptions: list[str] = []
+        if self.reporting_currency != self.currency and self.fx != 1.0:
+            self.assumptions.append(
+                f"converted {self.reporting_currency}->{self.currency} at {self.fx:.4f}"
+                + ("" if fx_live else " (fallback rate)"))
 
-        # --- fundamentals (millions of reporting currency) ---
-        self.revenue = _g(f, "revenue")
-        self.ebit = _g(f, "ebit")
-        self.ebitda = _g(f, "ebitdax")
-        self.dna = abs(_g(f, "dna")) if _g(f, "dna") is not None else None
-        self.net_income = _g(f, "net_profit")
-        self.income_tax = _g(f, "income_tax")
-        self.total_assets = _g(f, "total_assets")
-        self.total_current_assets = _g(f, "total_current_assets")
-        self.total_liabilities = _g(f, "total_liabilities")
-        self.total_current_liabilities = _g(f, "total_current_liabilities")
-        self.cash = _g(f, "cash")
-        self.total_debt = _g(f, "borrowings_current")
-        self.book_equity = _g(f, "total_equity")
-        self.op_cf = _g(f, "op_cash_flow")
-        self.dividends_paid = abs(_g(f, "dividends_paid")) if _g(f, "dividends_paid") is not None else None
-        self.eps = (_g(f, "eps_basic") / 100.0) if _g(f, "eps_basic") is not None else None      # -> currency/share
-        self.dps = (_g(f, "dps") / 100.0) if _g(f, "dps") is not None else None
+        fxm = self.fx  # shorthand for monetary conversion
+
+        # --- fundamentals, converted to millions of target currency ---
+        self.revenue = _cvt(_g(f, "revenue"), fxm)
+        self.ebit = _cvt(_g(f, "ebit"), fxm)
+        self.ebitda = _cvt(_g(f, "ebitdax"), fxm)
+        _dna = _g(f, "dna")
+        self.dna = _cvt(abs(_dna), fxm) if _dna is not None else None
+        self.net_income = _cvt(_g(f, "net_profit"), fxm)
+        self.income_tax = _cvt(_g(f, "income_tax"), fxm)
+        self.total_assets = _cvt(_g(f, "total_assets"), fxm)
+        self.total_current_assets = _cvt(_g(f, "total_current_assets"), fxm)
+        self.total_liabilities = _cvt(_g(f, "total_liabilities"), fxm)
+        self.total_current_liabilities = _cvt(_g(f, "total_current_liabilities"), fxm)
+        self.cash = _cvt(_g(f, "cash"), fxm)
+        self.total_debt = _cvt(_g(f, "borrowings_current"), fxm)
+        self.book_equity = _cvt(_g(f, "total_equity"), fxm)
+        self.op_cf = _cvt(_g(f, "op_cash_flow"), fxm)
+        _div = _g(f, "dividends_paid")
+        self.dividends_paid = _cvt(abs(_div), fxm) if _div is not None else None
+        # per-share figures: reported in cents -> currency/share, then FX.
+        self.eps = _cvt(_g(f, "eps_basic") / 100.0, fxm) if _g(f, "eps_basic") is not None else None
+        self.dps = _cvt(_g(f, "dps") / 100.0, fxm) if _g(f, "dps") is not None else None
+        # rates are unit-less — never FX-scaled.
         self.disc_disclosed = (_g(f, "discount_rate") / 100.0) if _g(f, "discount_rate") is not None else None
         self.grant_vol = (_g(f, "grant_volatility") / 100.0) if _g(f, "grant_volatility") is not None else None
 
         # capex: only trust a magnitude plausible for a full company statement
         capex = _g(f, "capex")
-        self.capex = capex if (capex and abs(capex) > 200) else None
+        self.capex = _cvt(capex, fxm) if (capex and abs(capex) > 200) else None
 
         # --- shares ---
         self.shares = _g(f, "wtd_avg_shares") or m.get("shares_outstanding")
 
-        # --- market ---
+        # --- market ---  (price already in the traded/target currency)
         self.price = m.get("price")
-        self.market_cap = m.get("market_cap")
-        if not self.market_cap and self.price and self.shares:
-            self.market_cap = self.price * self.shares
+        # market cap expressed in MILLIONS to match the fundamentals' scale.
+        mc = m.get("market_cap")
+        if not mc and self.price and self.shares:
+            mc = self.price * self.shares
+        self.market_cap = (mc / 1_000_000) if mc else None
         self.beta = m.get("beta")
         self.hist_vol = m.get("hist_vol")
         self.risk_free = m.get("risk_free")
@@ -123,18 +151,24 @@ class Ctx:
             self.assumptions.append("cost of equity proxied by disclosed discount rate")
 
     # helpers
-    def per_share(self, value_m: Optional[float]) -> Optional[float]:
+    def per_share(self, value_m: float | None) -> float | None:
         if value_m is None or not self.shares:
             return None
         return value_m * 1_000_000 / self.shares
 
     def fx_note(self) -> str:
+        """Trailing note flagging any residual currency mismatch.
+
+        Everything is converted to ``self.currency`` up front, so this only
+        fires in the unusual case where the market price is quoted in a
+        different currency than the target (kept as a safety flag).
+        """
         if self.price and self.market_ccy and self.market_ccy != self.currency:
-            return f" (NB: fundamentals in {self.currency}, price in {self.market_ccy} — convert for exact comparison)"
+            return f" (NB: price quoted in {self.market_ccy}, values in {self.currency})"
         return ""
 
 
-def _two_stage_pv(cf0: float, g_high: float, g_term: float, rate: float, n: int) -> Optional[float]:
+def _two_stage_pv(cf0: float, g_high: float, g_term: float, rate: float, n: int) -> float | None:
     if rate is None or rate <= g_term:
         return None
     pv = 0.0
@@ -318,7 +352,8 @@ def _pe(ctx: Ctx, spec):
     if ctx.price is None or ctx.eps in (None, 0):
         return _mk(spec, status="na", missing=["price", "EPS"])
     pe = ctx.price / ctx.eps
-    return _mk(spec, status="partial", value=pe, unit="x", note="Own trailing P/E; peer set needed to value." + ctx.fx_note())
+    return _mk(spec, status="partial", value=pe, unit="x",
+               note="Own trailing P/E; peer set needed to value." + ctx.fx_note())
 
 
 def _peg(ctx: Ctx, spec):
@@ -380,7 +415,8 @@ def _div_yield(ctx: Ctx, spec):
     if ctx.price in (None, 0) or ctx.dps is None:
         return _mk(spec, status="na", missing=["price", "DPS"])
     y = ctx.dps / ctx.price
-    return _mk(spec, status="partial", value=y, unit="yield", note="Own dividend yield; sector comparison needed." + ctx.fx_note())
+    return _mk(spec, status="partial", value=y, unit="yield",
+               note="Own dividend yield; sector comparison needed." + ctx.fx_note())
 
 
 def _fcf_yield(ctx: Ctx, spec):
@@ -390,7 +426,7 @@ def _fcf_yield(ctx: Ctx, spec):
         fcf = ctx.op_cf - capex
     if fcf is None or not ctx.market_cap:
         return _mk(spec, status="na", missing=["FCF", "market cap"])
-    return _mk(spec, status="ok", value=fcf * 1_000_000 / ctx.market_cap, unit="yield",
+    return _mk(spec, status="ok", value=fcf / ctx.market_cap, unit="yield",
                note="FCF / market cap.")
 
 
@@ -493,7 +529,8 @@ def _invested_capital(ctx):
 
 
 def _eva(ctx: Ctx, spec):
-    nopat = _nopat(ctx); ic = _invested_capital(ctx)
+    nopat = _nopat(ctx)
+    ic = _invested_capital(ctx)
     if nopat is None or ic is None or not ctx.wacc:
         return _mk(spec, status="na", missing=["NOPAT", "invested capital", "WACC"])
     eva = nopat - ctx.wacc * ic
@@ -502,7 +539,8 @@ def _eva(ctx: Ctx, spec):
 
 
 def _disc_econ_profit(ctx: Ctx, spec):
-    nopat = _nopat(ctx); ic = _invested_capital(ctx)
+    nopat = _nopat(ctx)
+    ic = _invested_capital(ctx)
     if nopat is None or ic is None or not ctx.wacc or ctx.wacc <= ctx.g_term:
         return _mk(spec, status="na", missing=["NOPAT", "IC", "WACC>g"])
     ep = nopat - ctx.wacc * ic
@@ -519,7 +557,8 @@ def _mva(ctx: Ctx, spec):
 
 
 def _roic_wacc(ctx: Ctx, spec):
-    nopat = _nopat(ctx); ic = _invested_capital(ctx)
+    nopat = _nopat(ctx)
+    ic = _invested_capital(ctx)
     if nopat is None or ic in (None, 0) or not ctx.wacc:
         return _mk(spec, status="na", missing=["NOPAT", "IC", "WACC"])
     roic = nopat / ic
@@ -675,8 +714,8 @@ def _total_yield(ctx: Ctx, spec):
 
 def _analyst_targets(ctx: Ctx, spec):
     if ctx.target_mean:
-        return _mk(spec, status="ok", value=ctx.target_mean, unit=f"{ctx.market_ccy}/share", intrinsic_ps=ctx.target_mean,
-                   note="Finnhub consensus mean target.")
+        return _mk(spec, status="ok", value=ctx.target_mean, unit=f"{ctx.market_ccy}/share",
+                   intrinsic_ps=ctx.target_mean, note="Finnhub consensus mean target.")
     return _mk(spec, status="na", missing=["analyst consensus (Finnhub key)"])
 
 
@@ -807,7 +846,8 @@ _add(S6, "Build-Up Method", _build_up)
 _add(S7, "Black–Scholes (Equity as a Call on Assets)", _black_scholes)
 _add(S7, "Merton Structural / Distance-to-Default", _merton)
 _add(S7, "Binomial / Lattice Model", _na_with(["volatility", "lattice params"], "Needs a volatility term structure."))
-_add(S7, "Real Options Valuation", _na_with(["project volatility", "option params"], "Needs project-level option parameters."))
+_add(S7, "Real Options Valuation",
+     _na_with(["project volatility", "option params"], "Needs project-level option parameters."))
 _add(S8, "Monte Carlo Intrinsic Value", _monte_carlo)
 _add(S8, "Scenario & Sensitivity Analysis", _scenario)
 _add(S8, "Reverse DCF", _reverse_dcf)

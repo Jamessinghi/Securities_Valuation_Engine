@@ -11,5 +11,11 @@ pandas>=2.2
 requests>=2.31
 yfinance>=0.2.40
 pandas-datareader>=0.10
-# Optional (image-based OCR fallback). Requires the tesseract binary installed separately.
+# Optional (image-based OCR fallback for scanned PDFs). Requires the `tesseract`
+# and `poppler` binaries installed separately (e.g. `brew install tesseract poppler`).
 pytesseract>=0.3.10
+pdf2image>=1.17
+
+# Dev tooling
+pytest>=8.0
+ruff>=0.4

@@ -2,7 +2,10 @@
 
 Upload a company's trailing-twelve-month filing set, OCR-extract the financials,
 pull free market data, and run **65 valuation methods** to triangulate an
-intrinsic value — for any listed security, on any chosen date.
+intrinsic value — for any listed security, on any chosen date. Everything is
+**priced in AUD**: the reporting currency is detected from the documents and
+converted at the valuation-date FX rate so the intrinsic value is directly
+comparable with the ASX price.
 
 > Educational reference only. Not personalised investment advice.
 
@@ -27,12 +30,47 @@ A five-step wizard:
 app/
   quarters.py        date -> current quarter + previous 4 completed quarters
   ocr/               pdfplumber extraction + field schema (+ Tesseract fallback)
-  market/            free feeds: Yahoo/Stooq, Finnhub, FRED, Ken French, Damodaran
-  valuation/         the 65 methods + triangulation engine
+    fields.py        canonical field schema; AU/IFRS + US-GAAP label synonyms
+    extractor.py     currency/scale detection, candidate scoring, confidence
+  market/            free feeds + FX: Yahoo/Stooq, Finnhub, FRED, Ken French, Damodaran
+  valuation/         the 65 methods + triangulation engine (FX -> AUD)
   export/            PDF (reportlab) + JPEG (Pillow)
   main.py            FastAPI routes
   static/            vanilla-JS wizard SPA
 ```
+
+### OCR engine
+
+Designed to read *any* filing, not just one company's template:
+
+- **Two-layer read** — uses the PDF text layer first (accurate on digital
+  filings); for scanned documents it falls back to Tesseract OCR when
+  `pytesseract` + `tesseract` + `pdf2image`/poppler are installed. If a document
+  is genuinely unreadable it is reported as such rather than returning silence.
+- **Currency & scale detection** — sniffs the reporting currency (USD/AUD/GBP/…)
+  and units ("in millions"/"in thousands"/"in billions") from statement headers
+  and normalises every monetary figure to *millions of the reporting currency*.
+- **Broad label synonyms** — each canonical field matches both AU/IFRS wording
+  (e.g. "Product sales", "Interest-bearing loans and borrowings") and US-GAAP
+  wording (e.g. "Net sales", "Long-term debt", "Total stockholders' equity").
+- **Candidate scoring** — every matching line is scored so genuine statement
+  rows beat prose, tables of contents and footnotes; note references ("2.5") and
+  footnote markers (the "1" in "EBITDAX1") are stripped, and bare years in prose
+  are penalised. Each extracted value carries a `high`/`medium`/`low` confidence.
+- **Never silently wrong** — a field the engine can't read with confidence is
+  omitted and listed in `missing_required`, which drives the UI's
+  "exactly what's missing" warning + re-upload / manual-entry paths.
+
+### Currency handling (AUD)
+
+1. The OCR layer detects each document's reporting currency.
+2. `market/feeds.fx_rate()` fetches the reporting→AUD rate for the valuation
+   date from Yahoo (`USDAUD=X`, inverting `AUDUSD=X` if needed), with a static
+   fallback flagged in the output.
+3. The valuation engine converts every monetary and per-share input to AUD up
+   front, so all 65 methods, the triangulated intrinsic value, and the price
+   comparison are in one currency. Rates, ratios and share counts are never
+   FX-scaled. The FX rate used is shown on the summary screen and in exports.
 
 ## Free data sources
 
@@ -42,6 +80,7 @@ app/
 | Analyst consensus / price targets | Finnhub | `FINNHUB_API_KEY` |
 | Risk-free yield + macro | FRED | `FRED_API_KEY` |
 | Fama-French / momentum factors | Ken French (`pandas-datareader`) | no |
+| FX rate (reporting currency → AUD) | Yahoo Finance (`{FROM}{TO}=X`) | no |
 | Equity risk premium | Damodaran (fallback constant) | no |
 
 Everything degrades gracefully: no network or no key just leaves those methods
@@ -70,10 +109,11 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 
 Then open http://127.0.0.1:8000.
 
-## Tests
+## Tests & linting
 
 ```bash
-./.venv/bin/python -m pytest tests/ -q
+./.venv/bin/python -m pytest tests/ -q     # unit tests (quarters, extractor)
+./.venv/bin/ruff check app tests           # lint (config in pyproject.toml)
 ```
 
 ## Notes & limitations
@@ -81,9 +121,9 @@ Then open http://127.0.0.1:8000.
 - Forecast growth and (where a WACC isn't disclosed) the discount rate are
   **assumptions**, surfaced on the summary screen. CapEx that OCR can't reliably
   isolate is proxied by D&A (flagged per method).
-- Financials are read in the report's reporting currency; if the market price is
-  in a different currency (e.g. USD financials vs an AUD share price), the
-  summary flags the mismatch rather than silently mixing them.
+- Financials are converted from the detected reporting currency to AUD at the
+  valuation-date FX rate (live from Yahoo, with a flagged fallback). If the FX
+  fetch fails the fallback rate is used and labelled as such.
 - Precedent transactions, factor-loading regressions, and option-implied
   volatility need data no single free feed provides — those methods are marked
   accordingly.

@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# pycodestyle errors (E), pyflakes (F), import sorting (I), bugbear (B),
+# comprehensions (C4), pyupgrade (UP).
+select = ["E", "F", "I", "B", "C4", "UP"]
+ignore = [
+    "B008",  # FastAPI uses function calls (File/Form) as argument defaults
+    "E402",  # app/main.py mounts static files after route defs by design
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

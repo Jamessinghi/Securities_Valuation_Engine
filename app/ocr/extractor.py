@@ -1,17 +1,35 @@
 """PDF extraction pipeline.
 
-Strategy: these filings are digital (text-based) PDFs, so `pdfplumber` text
-extraction is accurate and fast. For scanned/image pages we fall back to
-Tesseract OCR if the `pytesseract` + `tesseract` binary are available.
+Goal: extract a company's financial line items from *any* filing PDF, as
+robustly as possible, and report exactly what could not be read.
 
-For each canonical field we scan every line, match a label pattern, and pull
-the current-period numeric value (the first data column after the label),
-skipping note-reference tokens like "2.5" or "6.4(b)".
+How it works
+------------
+1. **Text layer** — digital filings (ASX Appendix 4E/4D, US 10-K/10-Q, results
+   presentations) carry a real text layer, which ``pdfplumber`` extracts
+   accurately. This is the primary source.
+2. **Image OCR fallback** — if a document is scanned (mostly empty text layer),
+   we rasterise the pages and run Tesseract, when ``pytesseract`` + the
+   ``tesseract`` binary + ``pdf2image`` (poppler) are available. Absent those,
+   the document is reported as unreadable rather than silently producing
+   nothing.
+3. **Currency & scale detection** — we sniff the reporting currency (USD / AUD /
+   GBP / …) and the units ("in millions" / "in thousands" / "in billions") from
+   the statement headers, and normalise every monetary figure to *millions of
+   the reporting currency* so downstream maths is unit-consistent.
+4. **Candidate scoring** — for each canonical field we gather every line whose
+   label matches, extract the current-period value (skipping note references
+   like "2.5" and footnote markers like the "1" in "EBITDAX1"), and score each
+   candidate so genuine statement rows beat prose, tables of contents and
+   footnotes. The best-scoring candidate wins; its score becomes a confidence.
+
+The extractor never raises for a missing figure — it simply omits the field and
+lists it in ``missing_required`` so the UI can offer re-upload or manual entry.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import pdfplumber
@@ -30,6 +48,57 @@ _PROSE = (
     "directors", " to ", "primarily", "represents", "typically", "between",
     "during the", "declaration", "contents",
 )
+
+
+# --------------------------------------------------------------------------- #
+#  Currency & scale detection                                                  #
+# --------------------------------------------------------------------------- #
+# Ordered so the most specific marker wins (US$ before a bare $).
+_CCY_MARKERS = (
+    ("USD", (r"us\$", r"\busd\b", r"u\.s\. dollar", r"united states dollar")),
+    ("AUD", (r"a\$", r"au\$", r"\baud\b", r"australian dollar")),
+    ("GBP", (r"£", r"\bgbp\b", r"pound sterling")),
+    ("EUR", (r"€", r"\beur\b")),
+    ("CAD", (r"c\$", r"\bcad\b", r"canadian dollar")),
+    ("NZD", (r"nz\$", r"\bnzd\b")),
+)
+_SCALE_MARKERS = (
+    (0.001, (r"in thousands", r"\$['’]?000", r"\$'?000", r"thousands of", r"figures in \$?000")),
+    (1000.0, (r"in billions", r"\$bn\b", r"billions of")),
+    (1.0, (r"in millions", r"\$\s?m\b", r"\bmillion", r"\$'?m\b", r"us\$million", r"a\$million")),
+)
+
+
+def detect_currency_and_scale(text: str) -> tuple[str | None, float]:
+    """Sniff (reporting_currency, scale_to_millions) from statement text.
+
+    ``scale_to_millions`` multiplies a raw figure to express it in millions:
+    values already in millions -> 1.0, thousands -> 0.001, billions -> 1000.0.
+    Returns ``(None, 1.0)`` when the currency cannot be determined.
+    """
+    low = text.lower()
+    currency = None
+    best = 0
+    for ccy, pats in _CCY_MARKERS:
+        hits = sum(len(re.findall(p, low)) for p in pats)
+        if hits > best:
+            best, currency = hits, ccy
+    scale = 1.0
+    scale_best = 0
+    for mult, pats in _SCALE_MARKERS:
+        hits = sum(len(re.findall(p, low)) for p in pats)
+        if hits > scale_best:
+            scale_best, scale = hits, mult
+    return currency, scale
+
+
+def _confidence(score: int) -> str:
+    """Map a candidate score to a human-readable confidence band."""
+    if score >= 5:
+        return "high"
+    if score >= 2:
+        return "medium"
+    return "low"
 
 
 def _to_float(tok: str) -> float | None:
@@ -118,13 +187,22 @@ def _score_candidate(line: str, tail: str, is_rate: bool, value: float | None) -
 
 @dataclass
 class DocResult:
+    """Outcome of extracting one document.
+
+    ``fields`` maps a canonical field key to a cell describing the value found:
+    ``{"value", "raw", "line", "confidence"}``. Monetary values are already
+    normalised to millions of ``currency``.
+    """
+
     filename: str
     doc_type: str
     doc_type_label: str
     pages: int
-    fields: dict[str, dict]        # key -> {"value": float, "raw": str, "page": int}
-    missing_required: list[str]    # human labels of required-but-not-found fields
+    fields: dict[str, dict]
+    missing_required: list[dict]   # [{"key","label"}] required but not found
     method: str = "text"           # text | ocr
+    currency: str | None = None    # detected reporting currency
+    scale_to_millions: float = 1.0 # multiplier applied to raw monetary figures
 
     def to_dict(self) -> dict:
         return {
@@ -135,6 +213,8 @@ class DocResult:
             "fields": self.fields,
             "missing_required": self.missing_required,
             "method": self.method,
+            "currency": self.currency,
+            "scale_to_millions": self.scale_to_millions,
             "ok": not self.missing_required,
         }
 
@@ -176,10 +256,14 @@ def _ocr_fallback(path: Path) -> list[str]:
 
 
 def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult:
+    """Extract canonical fields from one PDF and report what's missing."""
     path = Path(path)
     lines, n, method = _read_text(path)
     dtype = doc_type or detect_doc_type(path.name)
     dt = DOC_TYPE_BY_KEY.get(dtype, DOC_TYPE_BY_KEY["other"])
+
+    # Detect currency + scale from the whole document (headers repeat the unit).
+    currency, scale = detect_currency_and_scale("\n".join(lines))
 
     found: dict[str, dict] = {}
     for f in FIELDS:
@@ -205,7 +289,11 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
             continue
         # Best score wins; earliest occurrence breaks ties (statements precede appendices).
         best = max(candidates, key=lambda c: (c[0], -c[1]))
-        found[f.key] = {"value": best[2], "raw": best[3], "line": best[1]}
+        score, idx, value, raw = best
+        # Normalise monetary figures to millions of the reporting currency.
+        if f.is_monetary and scale != 1.0:
+            value = value * scale
+        found[f.key] = {"value": value, "raw": raw, "line": idx, "confidence": _confidence(score)}
 
     missing = [
         {"key": req, "label": next(fl.label for fl in FIELDS if fl.key == req)}
@@ -220,4 +308,6 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
         fields=found,
         missing_required=missing,
         method=method,
+        currency=currency,
+        scale_to_millions=scale,
     )

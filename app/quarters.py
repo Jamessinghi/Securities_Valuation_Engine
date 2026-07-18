@@ -32,7 +32,7 @@ class Quarter:
     def short(self) -> str:
         return f"Q{self.quarter} {self.year}"
 
-    def prev(self) -> "Quarter":
+    def prev(self) -> Quarter:
         if self.quarter == 1:
             return Quarter(self.year - 1, 4)
         return Quarter(self.year, self.quarter - 1)

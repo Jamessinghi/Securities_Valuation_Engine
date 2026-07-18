@@ -195,7 +195,10 @@ function fmt(v) {
 }
 function renderSummary(sum) {
   $("#summaryTitle").textContent = `${sum.meta.market}:${sum.meta.ticker}`;
-  $("#summaryMeta").textContent = `Valuation date ${sum.meta.date} · ${sum.meta.current_label}`;
+  const fxNote = (sum.meta.reporting_currency && sum.meta.reporting_currency !== sum.meta.currency)
+    ? ` · ${sum.meta.reporting_currency}→${sum.meta.currency} @ ${sum.meta.fx}${sum.meta.fx_live ? "" : " (fallback)"}`
+    : "";
+  $("#summaryMeta").textContent = `Valuation date ${sum.meta.date} · ${sum.meta.current_label} · priced in ${sum.meta.currency || "AUD"}${fxNote}`;
   const c = sum.counts || {};
   $("#counts").innerHTML =
     `<span class="pill ok">${c.ok || 0} computed</span>

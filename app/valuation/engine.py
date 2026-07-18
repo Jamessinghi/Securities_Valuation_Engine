@@ -1,7 +1,13 @@
-"""Valuation orchestration: merge extracted docs, run all 65 methods, triangulate."""
+"""Valuation orchestration: merge extracted docs, run all 65 methods, triangulate.
+
+Everything is priced in a single **target currency** (AUD by default). The
+reporting currency is taken from the uploaded documents (OCR-detected), and an
+FX rate for the valuation date converts the financials into the target currency
+so the triangulated intrinsic value is directly comparable with the (AUD) market
+price.
+"""
 from __future__ import annotations
 
-from datetime import date
 from statistics import median
 
 from .methods import SPEC, Ctx, MethodResult
@@ -24,13 +30,28 @@ def merge_fundamentals(docs: list[dict]) -> dict:
     return merged
 
 
-def build_context(docs: list[dict], market: dict | None, currency: str = "USD") -> Ctx:
+def detect_reporting_currency(docs: list[dict]) -> str | None:
+    """Reporting currency from the highest-priority document that declares one."""
+    order = {k: i for i, k in enumerate(_DOC_PRIORITY)}
+    for doc in sorted(docs, key=lambda d: order.get(d.get("doc_type", "other"), 99)):
+        if doc.get("currency"):
+            return doc["currency"]
+    return None
+
+
+def build_context(docs: list[dict], market: dict | None, currency: str = "AUD",
+                  reporting_currency: str | None = None, fx: float = 1.0,
+                  fx_live: bool = True) -> Ctx:
     fundamentals = merge_fundamentals(docs)
-    return Ctx(fundamentals, market, currency=currency)
+    return Ctx(fundamentals, market, currency=currency,
+               reporting_currency=reporting_currency, fx=fx, fx_live=fx_live)
 
 
-def run_valuation(docs: list[dict], market: dict | None, currency: str = "USD") -> dict:
-    ctx = build_context(docs, market, currency=currency)
+def run_valuation(docs: list[dict], market: dict | None, currency: str = "AUD",
+                  reporting_currency: str | None = None, fx: float = 1.0,
+                  fx_live: bool = True) -> dict:
+    ctx = build_context(docs, market, currency=currency,
+                        reporting_currency=reporting_currency, fx=fx, fx_live=fx_live)
     results: list[MethodResult] = []
     for spec in SPEC:
         try:
@@ -58,7 +79,7 @@ def run_valuation(docs: list[dict], market: dict | None, currency: str = "USD") 
             "intrinsic": round(intrinsic, 3),
             "price": ctx.price,
             "upside": round(gap, 4),
-            "currency_reporting": ctx.currency,
+            "currency": ctx.currency,
             "currency_price": ctx.market_ccy,
             "comparable": ctx.market_ccy == ctx.currency,
         }
@@ -67,6 +88,8 @@ def run_valuation(docs: list[dict], market: dict | None, currency: str = "USD") 
         "results": [r.to_dict() for r in results],
         "intrinsic_value_per_share": round(intrinsic, 3) if intrinsic is not None else None,
         "intrinsic_currency": ctx.currency,
+        "reporting_currency": ctx.reporting_currency,
+        "fx": ctx.fx,
         "n_intrinsic_models": len(ps_values),
         "counts": counts,
         "verdict": verdict,

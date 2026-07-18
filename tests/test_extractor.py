@@ -1,6 +1,5 @@
-from pathlib import Path
-import pytest
 from app.ocr.extractor import _pick_value
+
 
 def test_pick_skips_note_ref():
     assert _pick_value(" 2.5 25.2 37.8") == 25.2

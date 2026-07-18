@@ -200,6 +200,47 @@ def _ff_factors(md: MarketData) -> None:
         md.notes.append("Fama-French factors unavailable (needs network/pandas-datareader).")
 
 
+# Static fallback FX (units of target per 1 unit of source) used only when the
+# live rate can't be fetched; always flagged in notes by the caller.
+_FX_FALLBACK = {("USD", "AUD"): 1.52, ("AUD", "USD"): 0.66, ("GBP", "AUD"): 1.95,
+                ("EUR", "AUD"): 1.63, ("NZD", "AUD"): 0.92, ("CAD", "AUD"): 1.12}
+
+
+def fx_rate(from_ccy: str, to_ccy: str, as_of: date) -> tuple[float | None, bool]:
+    """Return (rate, is_live) to convert 1 ``from_ccy`` into ``to_ccy``.
+
+    Uses Yahoo's ``{FROM}{TO}=X`` daily close on/just before ``as_of``; if that
+    fails it inverts ``{TO}{FROM}=X``; if that also fails it uses a static
+    fallback (``is_live=False``). Same-currency returns ``(1.0, True)``.
+    """
+    if not from_ccy or not to_ccy or from_ccy == to_ccy:
+        return 1.0, True
+    try:
+        from datetime import timedelta
+
+        import yfinance as yf
+        start = (as_of - timedelta(days=10)).isoformat()
+        end = (as_of + timedelta(days=3)).isoformat()
+        for sym, invert in ((f"{from_ccy}{to_ccy}=X", False), (f"{to_ccy}{from_ccy}=X", True)):
+            h = yf.download(sym, start=start, end=end, progress=False, auto_adjust=True)
+            if h is None or h.empty:
+                continue
+            close = h["Close"]
+            if hasattr(close, "columns"):
+                close = close.iloc[:, 0]
+            close = close.dropna()
+            upto = close[close.index.date <= as_of]
+            val = float((upto if not upto.empty else close).iloc[-1])
+            if val > 0:
+                return (1.0 / val if invert else val), True
+    except Exception:
+        pass
+    fb = _FX_FALLBACK.get((from_ccy, to_ccy))
+    if fb is None and (to_ccy, from_ccy) in _FX_FALLBACK:
+        fb = 1.0 / _FX_FALLBACK[(to_ccy, from_ccy)]
+    return fb, False
+
+
 def market_snapshot(market: str, ticker: str, as_of: date) -> MarketData:
     symbol, index, ccy = parse_symbol(market, ticker)
     md = MarketData(symbol=symbol, index_symbol=index, currency=ccy)

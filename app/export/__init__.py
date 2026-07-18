@@ -1,1 +1,1 @@
-from .report import build_pdf, build_jpeg  # noqa: F401
+from .report import build_jpeg, build_pdf  # noqa: F401

@@ -1,7 +1,12 @@
 """Canonical financial field schema, per-field label patterns, and document types.
 
-Every value is expressed in the report's reporting currency (Santos reports in
-US$ million) except per-share figures which are in cents as reported.
+Each canonical field carries several regex label alternatives so the extractor
+generalises across reporting standards — Australian (ASX / IFRS) statements
+(e.g. "Product sales", "Net profit for the period", "Interest-bearing loans")
+*and* US-GAAP filings (e.g. "Net sales", "Net income", "Long-term debt",
+"Total stockholders' equity"). Values are stored in the report's reporting
+currency, in millions (the extractor normalises any "thousands"/"billions"
+scale), except per-share figures which stay in the reported per-share unit.
 """
 from __future__ import annotations
 
@@ -10,34 +15,70 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Field:
+    """One canonical financial line item and how to find it in raw text.
+
+    Attributes
+    ----------
+    key      : stable identifier used throughout the engine.
+    label    : human-readable name shown in the UI / manual-entry form.
+    patterns : ordered regex alternatives (matched case-insensitively) that a
+               line's label text must contain for the line to be a candidate.
+    unit     : ``USD_m`` (monetary, millions of reporting currency),
+               ``cents`` (per-share as reported), ``percent`` (a rate), or
+               ``count_m`` (a share count).
+    kind     : ``flow`` | ``stock`` | ``pershare`` | ``rate`` — controls scale
+               normalisation (only monetary flow/stock values are rescaled).
+    """
+
     key: str
-    label: str            # human label shown in UI / manual entry
-    patterns: tuple[str, ...]  # regex label alternatives (case-insensitive)
-    unit: str = "USD_m"   # USD_m | cents | percent | count_m
-    kind: str = "flow"    # flow | stock | pershare | rate
+    label: str
+    patterns: tuple[str, ...]
+    unit: str = "USD_m"
+    kind: str = "flow"
+
+    @property
+    def is_monetary(self) -> bool:
+        """True when the value is a currency amount subject to scale/FX."""
+        return self.unit == "USD_m"
 
 
 # ---- Canonical fields ------------------------------------------------------
+# Patterns list AU/IFRS wording first, then US-GAAP synonyms, so the extractor
+# works on Santos-style *and* 10-K-style statements.
 FIELDS: list[Field] = [
-    Field("revenue", "Product sales / Revenue",
+    Field("revenue", "Revenue / Net sales",
           (r"product sales", r"revenue from contracts with customers[ \-–]+product sales",
-           r"total revenue", r"^revenue")),
+           r"total revenues?", r"net sales", r"net revenues?", r"total net sales",
+           r"sales revenue", r"^revenue\b")),
     Field("ebitdax", "EBITDA(X)", (r"ebitdax", r"ebitda")),
-    Field("ebit", "EBIT", (r"^ebit\b", r"\bebit2?\b")),
+    Field("ebit", "EBIT / Operating income",
+          (r"^ebit\b", r"\bebit2?\b", r"operating income", r"operating profit",
+           r"income from operations")),
     Field("dna", "Depreciation & depletion/amortisation",
-          (r"depreciation and depletion", r"depreciation, depletion", r"depreciation and amortis")),
-    Field("impairment", "Impairment", (r"impairment loss", r"impairment of non-current assets")),
-    Field("net_profit", "Net profit for the period",
+          (r"depreciation and depletion", r"depreciation, depletion", r"depreciation and amortis",
+           r"depreciation, depletion and amortis", r"depreciation & amortis")),
+    Field("impairment", "Impairment", (r"impairment loss", r"impairment of non-current assets",
+                                       r"impairment charge", r"asset impairment")),
+    Field("net_profit", "Net profit / Net income",
           (r"net profit/?\(?loss\)? for the period(?! attributable)", r"net profit for the period",
-           r"profit for the period")),
-    Field("underlying_profit", "Underlying profit", (r"underlying profit for the period",)),
-    Field("income_tax", "Income tax expense", (r"income tax expense", r"income tax benefit")),
-    Field("eps_basic", "Basic EPS (cents)",
-          (r"^\s*basic (?:profit|earnings)(?:/?\(?loss\)?)? per share",), unit="cents", kind="pershare"),
-    Field("eps_diluted", "Diluted EPS (cents)",
-          (r"^\s*diluted (?:profit|earnings)(?:/?\(?loss\)?)? per share",), unit="cents", kind="pershare"),
-    Field("dps", "Dividends per share (cents)",
-          (r"^\s*(?:total )?dividends? per share", r"^\s*(?:final |interim )?dividend per share"),
+           r"profit for the period", r"net income(?! per)(?! \()", r"net earnings",
+           r"net income attributable")),
+    Field("underlying_profit", "Underlying / adjusted profit",
+          (r"underlying profit for the period", r"underlying profit", r"adjusted net income")),
+    Field("income_tax", "Income tax expense",
+          (r"income tax expense", r"income tax benefit", r"provision for income taxes",
+           r"income tax (?:expense|provision)")),
+    Field("eps_basic", "Basic EPS (per share)",
+          (r"^\s*basic (?:profit|earnings|net income|net loss)(?:/?\(?loss\)?)? per share",
+           r"^\s*basic (?:earnings|income) per (?:common )?share", r"^\s*basic per share"),
+          unit="cents", kind="pershare"),
+    Field("eps_diluted", "Diluted EPS (per share)",
+          (r"^\s*diluted (?:profit|earnings|net income|net loss)(?:/?\(?loss\)?)? per share",
+           r"^\s*diluted (?:earnings|income) per (?:common )?share"),
+          unit="cents", kind="pershare"),
+    Field("dps", "Dividends per share",
+          (r"^\s*(?:total )?dividends? per share", r"^\s*(?:final |interim )?dividend per share",
+           r"^\s*(?:cash )?dividends? declared per (?:common )?share"),
           unit="cents", kind="pershare"),
     Field("wtd_avg_shares", "Weighted avg shares (m)", (r"weighted average number of (?:ordinary )?shares",),
           unit="count_m", kind="stock"),
@@ -49,16 +90,22 @@ FIELDS: list[Field] = [
     Field("total_liabilities", "Total liabilities", (r"total liabilities",), kind="stock"),
     Field("total_current_liabilities", "Total current liabilities", (r"total current liabilities",), kind="stock"),
     Field("cash", "Cash & cash equivalents",
-          (r"cash and cash equivalents at the end", r"cash and cash equivalents"), kind="stock"),
-    Field("borrowings_current", "Interest-bearing borrowings (current)",
-          (r"interest-bearing loans and borrowings",), kind="stock"),
+          (r"cash and cash equivalents at the end", r"cash and cash equivalents",
+           r"cash and short-term investments"), kind="stock"),
+    Field("borrowings_current", "Interest-bearing debt / borrowings",
+          (r"interest-bearing loans and borrowings", r"long-term debt", r"total debt",
+           r"borrowings", r"total borrowings"), kind="stock"),
     Field("total_equity", "Total equity / net assets",
-          (r"total equity", r"net assets/?equity", r"^net assets"), kind="stock"),
+          (r"total equity", r"net assets/?equity", r"^net assets",
+           r"total (?:stockholders|shareholders)'? equity", r"total equity attributable"), kind="stock"),
     Field("op_cash_flow", "Net cash from operating activities",
-          (r"net cash (?:flows? )?from operating activities", r"net cash provided by operating"), kind="flow"),
-    Field("capex", "Capital expenditure / payments for PP&E",
-          (r"capital expenditure", r"payments for (?:property, plant and equipment|oil and gas assets|exploration)"),
-          kind="flow"),
+          (r"net cash (?:flows? )?from operating activities", r"net cash provided by operating",
+           r"cash (?:flows? )?(?:provided by|from) operations",
+           r"net cash (?:provided by|used in) operating"), kind="flow"),
+    Field("capex", "Capital expenditure / PP&E purchases",
+          (r"capital expenditure", r"payments for (?:property, plant and equipment|oil and gas assets|exploration)",
+           r"purchases? of property,? plant and equipment", r"additions to property",
+           r"capital expenditures?"), kind="flow"),
     Field("dividends_paid", "Dividends paid", (r"dividends paid",), kind="flow"),
     Field("free_cash_flow", "Free cash flow", (r"free cash flow",), kind="flow"),
     Field("discount_rate", "Discount rate / WACC (%)",

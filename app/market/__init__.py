@@ -1,1 +1,1 @@
-from .feeds import market_snapshot, MarketData  # noqa: F401
+from .feeds import MarketData, market_snapshot  # noqa: F401
