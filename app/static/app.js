@@ -11,6 +11,11 @@ const S = {
 };
 const API_BASE = (window.SVE_API_BASE || "").replace(/\/$/, "");
 const apiUrl = (path) => `${API_BASE}${path}`;
+const PDFJS_VERSION = "4.10.38";
+const PDFJS_MODULE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.mjs`;
+const PDFJS_WORKER = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.mjs`;
+const MAX_BROWSER_TEXT_CHARS = 20 * 1024 * 1024;
+let pdfjsPromise = null;
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
@@ -174,6 +179,67 @@ $("#dateInput").addEventListener("change", async (e) => {
 $("#next2").addEventListener("click", () => { if (!S.period) return toast("Pick a date first."); buildBubbles(); goto(3); });
 
 // ---------- STEP 3: uploads ----------
+async function loadPdfJs() {
+  if (!pdfjsPromise) {
+    pdfjsPromise = import(PDFJS_MODULE).then((pdfjs) => {
+      pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+      return pdfjs;
+    });
+  }
+  return pdfjsPromise;
+}
+
+function textContentToLines(content) {
+  const lines = [];
+  let current = [];
+  let previousY = null;
+  for (const item of content.items || []) {
+    if (typeof item.str !== "string") continue;
+    const y = Array.isArray(item.transform) ? item.transform[5] : previousY;
+    if (current.length && previousY !== null && y !== null && Math.abs(y - previousY) > 2.5) {
+      lines.push(current.join(" ").replace(/\s+/g, " ").trim());
+      current = [];
+    }
+    if (item.str.trim()) current.push(item.str.trim());
+    if (item.hasEOL && current.length) {
+      lines.push(current.join(" ").replace(/\s+/g, " ").trim());
+      current = [];
+    }
+    previousY = y;
+  }
+  if (current.length) lines.push(current.join(" ").replace(/\s+/g, " ").trim());
+  return lines.filter(Boolean).join("\n");
+}
+
+async function extractPdfTextLocally(file, onProgress) {
+  const pdfjs = await loadPdfJs();
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const loadingTask = pdfjs.getDocument({data: bytes, isEvalSupported: false});
+  const pdf = await loadingTask.promise;
+  const pages = [];
+  let totalChars = 0;
+  try {
+    for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
+      const page = await pdf.getPage(pageNo);
+      const text = textContentToLines(await page.getTextContent({disableNormalization: false}));
+      pages.push(text);
+      totalChars += text.length;
+      page.cleanup();
+      if (totalChars > MAX_BROWSER_TEXT_CHARS) {
+        throw new Error("Extracted text exceeds the 20 MB browser-transfer limit");
+      }
+      if (pageNo === 1 || pageNo === pdf.numPages || pageNo % 5 === 0) {
+        onProgress(pageNo, pdf.numPages);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+  } finally {
+    await pdf.destroy();
+  }
+  const readablePages = pages.filter((page) => page.trim().length >= 20).length;
+  return {pages, readableRatio: pages.length ? readablePages / pages.length : 0};
+}
+
 function buildBubbles() {
   const p = S.period;
   const slots = [
@@ -216,18 +282,44 @@ function buildBubbles() {
 async function uploadFile(slot, file) {
   const bub = $(`#bub-${slot}`), st = $(`#st-${slot}`), fl = $(`#fl-${slot}`);
   bub.className = "bubble";
-  st.innerHTML = `<span class="spinner"></span> Extracting with OCR…`;
+  st.innerHTML = `<span class="spinner"></span> Reading PDF locally…`;
   fl.innerHTML = "";
   if (file.size > 50 * 1024 * 1024) {
     st.className = "status warn";
     st.textContent = "Document limit: PDF exceeds the 50 MB upload limit.";
     return;
   }
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("doc_type", bub.dataset.dt);
   try {
-    const res = await api("/api/extract", { method: "POST", body: fd });
+    let res;
+    let localFailure = null;
+    try {
+      const local = await extractPdfTextLocally(file, (page, total) => {
+        st.innerHTML = `<span class="spinner"></span> Reading PDF locally… ${page}/${total} pages`;
+      });
+      if (local.readableRatio < 0.4) {
+        throw new Error("PDF is mostly scanned images");
+      }
+      st.innerHTML = `<span class="spinner"></span> Matching financial fields…`;
+      res = await api("/api/extract-text", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({filename: file.name, doc_type: bub.dataset.dt, pages: local.pages}),
+      });
+    } catch (err) {
+      localFailure = err;
+    }
+    if (!res) {
+      st.innerHTML = `<span class="spinner"></span> Local text unavailable; trying server OCR…`;
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("doc_type", bub.dataset.dt);
+      try {
+        res = await api("/api/extract", {method: "POST", body: fd});
+      } catch (serverError) {
+        const localNote = localFailure?.message ? ` Local extraction: ${localFailure.message}.` : "";
+        throw new Error(`${serverError.message}${localNote}`);
+      }
+    }
     S.docs[slot] = res;
     const nFields = Object.keys(res.fields || {}).length;
     if (res.missing_required && res.missing_required.length) {
@@ -240,7 +332,7 @@ async function uploadFile(slot, file) {
       st.className = "status ok";
       st.innerHTML = `✓ ${res.filename} · ${nFields} fields extracted${
         res.pages_processed < res.pages ? ` · ${res.pages_processed}/${res.pages} targeted pages` : ""
-      }
+      }${res.method === "browser-text" ? " · processed on this device" : ""}
         <div class="reupload" data-slot="${slot}">↻ Replace</div>`;
     }
     fl.innerHTML = Object.entries(res.fields || {}).slice(0, 8)

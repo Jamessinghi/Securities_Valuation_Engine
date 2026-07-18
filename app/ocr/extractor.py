@@ -520,7 +520,42 @@ def extract_document(path: str | Path, doc_type: str | None = None,
     lines, n, method, pages_processed, warnings = _read_text(
         path, max_pages=max_pages, max_text_pages=max_text_pages,
         max_ocr_pages=max_ocr_pages)
-    dtype = doc_type or detect_doc_type(path.name)
+    return _extract_lines(
+        lines, filename=path.name, doc_type=doc_type, pages=n,
+        method=method, pages_processed=pages_processed, warnings=warnings)
+
+
+def extract_page_texts(page_text: list[str], filename: str,
+                       doc_type: str | None = None, *,
+                       max_pages: int = 500, max_text_pages: int = 80) -> DocResult:
+    """Extract fields from PDF text produced in the user's browser.
+
+    The browser performs the memory-heavy PDF parsing.  This function applies
+    the same targeted-page selection and canonical field scoring as the normal
+    server-side PDF path, keeping results consistent while allowing a small
+    backend instance to process large digital filings.
+    """
+    n = len(page_text)
+    if n > max_pages:
+        raise PdfLimitError(f"PDF has {n} pages; the safe limit is {max_pages} pages")
+    selected = _target_pages(page_text, max_text_pages)
+    lines: list[str] = []
+    for idx in selected:
+        lines.extend(page_text[idx].splitlines())
+        lines.append(_PAGE_BREAK)
+    warnings = ["PDF text extracted locally in the browser; original file was not uploaded"]
+    if len(selected) < n:
+        warnings.append(f"Targeted {len(selected)} of {n} pages to stay within hosting limits")
+    return _extract_lines(
+        lines, filename=filename, doc_type=doc_type, pages=n,
+        method="browser-text", pages_processed=len(selected), warnings=warnings)
+
+
+def _extract_lines(lines: list[str], *, filename: str, doc_type: str | None,
+                   pages: int, method: str, pages_processed: int,
+                   warnings: list[str]) -> DocResult:
+    """Interpret already-extracted lines using the canonical field rules."""
+    dtype = doc_type or detect_doc_type(filename)
     dt = DOC_TYPE_BY_KEY.get(dtype, DOC_TYPE_BY_KEY["other"])
 
     # Detect currency + scale from the whole document (headers repeat the unit).
@@ -582,10 +617,10 @@ def extract_document(path: str | Path, doc_type: str | None = None,
         if req not in found
     ]
     return DocResult(
-        filename=path.name,
+        filename=filename,
         doc_type=dtype,
         doc_type_label=dt.label,
-        pages=n,
+        pages=pages,
         fields=found,
         missing_required=missing,
         method=method,

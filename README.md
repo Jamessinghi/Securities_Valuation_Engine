@@ -315,17 +315,37 @@ down when idle, so the first request after inactivity may take longer.
 
 ### Hosted PDF resource limits
 
-The defaults are deliberately sized for a free Render instance: 50 MB per
-upload, 500 source pages, 80 retained text pages and 40 OCR pages. They can be
-changed with `MAX_UPLOAD_MB`, `MAX_PDF_PAGES`, `MAX_TEXT_PAGES` and
-`MAX_OCR_PAGES`. Exceeding a hard limit returns HTTP 413 with a specific UI
-message. Temporary uploads are deleted after extraction, including failure
-paths. A targeted extraction adds a warning such as `80/286 targeted pages`
-instead of silently pretending every page was processed.
+Digital PDFs are parsed on the user's device with PDF.js. The browser sends
+page text to `/api/extract-text`, and the backend applies the same targeted-page
+selection, statement context and canonical field scoring as a normal upload.
+The original PDF therefore never enters Render memory on the common path.
+Progress is displayed while pages are read, and the result records
+`method=browser-text` for auditability.
 
-The synchronous design is intentional for the free deployment: Render's local
-filesystem is ephemeral and the service sleeps when idle, so an in-process
-background queue could lose jobs. A durable asynchronous queue should only be
+Image-only/scanned documents, unavailable browser PDF.js, or local extraction
+errors automatically fall back to `/api/extract`, where the bounded server OCR
+pipeline remains available. API keys, market feeds, canonical matching and the
+valuation engine stay server-side; no provider secret is exposed to Pages.
+
+The defaults are 50 MB per fallback upload, 20 MB of browser-extracted text,
+500 source pages, 80 retained text pages and 40 OCR pages. They can be changed
+with `MAX_UPLOAD_MB`, `MAX_BROWSER_TEXT_MB`, `MAX_PDF_PAGES`,
+`MAX_TEXT_PAGES` and `MAX_OCR_PAGES`. Exceeding a hard limit returns HTTP 413
+with a specific UI message. Temporary fallback uploads are deleted after
+extraction, including failure paths. A targeted extraction adds a warning such
+as `80/286 targeted pages` instead of silently pretending every page was
+processed.
+
+The Pages frontend loads the version-pinned PDF.js module and worker from
+jsDelivr. If the CDN is unavailable, the application transparently attempts the
+original server extraction route. PDF page processing yields to the browser
+regularly and PDF.js performs parsing in its own worker, keeping the wizard
+responsive during large filings.
+
+The synchronous backend design is intentional for the free deployment:
+Render's local filesystem is ephemeral and the service sleeps when idle, so an
+in-process background queue could lose jobs. The browser now supplies the
+expensive PDF parsing compute; a durable asynchronous queue should only be
 introduced together with external object storage and a persistent job store.
 
 ## Tests & linting

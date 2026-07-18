@@ -1,4 +1,7 @@
-from app.main import ComputeIn, api_compute, health
+import pytest
+from fastapi import HTTPException
+
+from app.main import BrowserExtractIn, ComputeIn, api_compute, api_extract_text, health
 
 
 def test_compute_normalizes_manual_rate_overrides_and_reruns_capm():
@@ -34,3 +37,30 @@ def test_compute_accepts_specialist_method_override():
 
 def test_health_check_is_provider_independent():
     assert health() == {"status": "ok", "service": "securities-valuation-engine"}
+
+
+def test_browser_text_endpoint_extracts_without_uploading_pdf():
+    result = api_extract_text(BrowserExtractIn(
+        filename="annual-report.pdf",
+        doc_type="annual_report",
+        pages=[
+            "Consolidated income statement\nRevenue 5,000 4,500\n"
+            "Net profit after tax 800 700\nUS$ million",
+            "Consolidated statement of financial position\n"
+            "Total assets 12,000 11,000\nTotal liabilities 5,000 4,800\n"
+            "Total equity 7,000 6,200",
+        ],
+    ))
+
+    assert result["method"] == "browser-text"
+    assert result["pages"] == 2
+    assert result["fields"]["revenue"]["value"] == 5000
+    assert any("original file was not uploaded" in warning for warning in result["warnings"])
+
+
+def test_browser_text_endpoint_rejects_scanned_document_placeholder():
+    with pytest.raises(HTTPException) as exc:
+        api_extract_text(BrowserExtractIn(
+            filename="scan.pdf", doc_type="annual_report", pages=["", "", "cover"],
+        ))
+    assert exc.value.status_code == 422

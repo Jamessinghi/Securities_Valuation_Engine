@@ -16,7 +16,7 @@ from .config import UPLOAD_DIR, settings
 from .export import build_jpeg, build_pdf
 from .market import market_snapshot
 from .market.feeds import fx_rate
-from .ocr import DOC_TYPES, extract_document
+from .ocr import DOC_TYPES, extract_document, extract_page_texts
 from .ocr.extractor import PdfLimitError
 from .quarters import resolve_period
 from .valuation import run_valuation
@@ -96,6 +96,41 @@ async def api_extract(file: UploadFile = File(...), doc_type: str = Form("")):
     out = res.to_dict()
     out["filename"] = file.filename or dest.name
     return out
+
+
+class BrowserExtractIn(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    doc_type: str = ""
+    pages: list[str]
+
+
+@app.post("/api/extract-text")
+def api_extract_text(body: BrowserExtractIn):
+    """Interpret PDF text extracted locally by PDF.js in the user's browser."""
+    if not body.filename.lower().endswith(".pdf"):
+        raise HTTPException(415, "Only PDF documents are supported")
+    if not body.pages:
+        raise HTTPException(422, "No readable PDF text was supplied")
+    if len(body.pages) > settings.max_pdf_pages:
+        raise HTTPException(
+            413, f"PDF has {len(body.pages)} pages; the safe limit is {settings.max_pdf_pages} pages")
+    text_chars = sum(len(page) for page in body.pages)
+    if text_chars > settings.max_browser_text_mb * 1024 * 1024:
+        raise HTTPException(
+            413, f"Extracted text exceeds the {settings.max_browser_text_mb} MB text limit")
+    readable = sum(bool(page.strip()) for page in body.pages)
+    if readable / len(body.pages) < 0.4:
+        raise HTTPException(
+            422, "This PDF is mostly scanned images and requires server-side OCR")
+    try:
+        result = extract_page_texts(
+            body.pages, filename=Path(body.filename).name,
+            doc_type=body.doc_type or None,
+            max_pages=settings.max_pdf_pages,
+            max_text_pages=settings.max_text_pages)
+    except PdfLimitError as exc:
+        raise HTTPException(413, str(exc)) from exc
+    return result.to_dict()
 
 
 class ComputeIn(BaseModel):

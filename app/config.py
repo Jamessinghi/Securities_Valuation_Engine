@@ -33,6 +33,7 @@ class Settings:
     max_pdf_pages: int = field(default_factory=lambda: int(os.getenv("MAX_PDF_PAGES", "500")))
     max_text_pages: int = field(default_factory=lambda: int(os.getenv("MAX_TEXT_PAGES", "80")))
     max_ocr_pages: int = field(default_factory=lambda: int(os.getenv("MAX_OCR_PAGES", "40")))
+    max_browser_text_mb: int = field(default_factory=lambda: int(os.getenv("MAX_BROWSER_TEXT_MB", "20")))
 
     @property
     def cors_origins(self) -> list[str]:
