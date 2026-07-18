@@ -1,0 +1,38 @@
+"""Central configuration. Secrets are read from the environment / .env only.
+
+Nothing here hard-codes a key, so committing this file to a public repo is safe.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env if present (git-ignored). Silent if it does not exist.
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
+
+UPLOAD_DIR = BASE_DIR / "uploads"
+EXPORT_DIR = BASE_DIR / "exports"
+UPLOAD_DIR.mkdir(exist_ok=True)
+EXPORT_DIR.mkdir(exist_ok=True)
+
+
+@dataclass
+class Settings:
+    finnhub_api_key: str = field(default_factory=lambda: os.getenv("FINNHUB_API_KEY", "").strip())
+    fred_api_key: str = field(default_factory=lambda: os.getenv("FRED_API_KEY", "").strip())
+    host: str = field(default_factory=lambda: os.getenv("HOST", "127.0.0.1"))
+    port: int = field(default_factory=lambda: int(os.getenv("PORT", "8000")))
+
+    def status(self) -> dict[str, bool]:
+        """Which optional keys are present (never exposes the value)."""
+        return {
+            "finnhub": bool(self.finnhub_api_key),
+            "fred": bool(self.fred_api_key),
+        }
+
+
+settings = Settings()

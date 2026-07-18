@@ -1,0 +1,22 @@
+# Secrets — never commit these (repo is public)
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime data
+uploads/
+*.log
+exports/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

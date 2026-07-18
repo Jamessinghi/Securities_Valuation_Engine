@@ -1,0 +1,97 @@
+<link rel="stylesheet" href="/styles.css" />
+<div id="app">
+  <header class="topbar">
+    <div class="brand">📈 Securities Valuation Engine</div>
+    <div class="steps">
+      <span data-step="1" class="dot active">1 · Stock</span>
+      <span data-step="2" class="dot">2 · Date</span>
+      <span data-step="3" class="dot">3 · Documents</span>
+      <span data-step="4" class="dot">4 · Manual</span>
+      <span data-step="5" class="dot">5 · Valuation</span>
+    </div>
+    <div id="exportWrap" class="export-wrap hidden">
+      <button id="exportBtn" class="btn-sm">Export ▾</button>
+      <div id="exportMenu" class="export-menu hidden">
+        <button data-fmt="pdf">Download PDF</button>
+        <button data-fmt="jpeg">Download JPEG</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- STEP 1: Welcome / ticker -->
+  <section class="screen active" id="screen1">
+    <div class="center-col">
+      <h1>Value any listed security</h1>
+      <p class="muted">Enter the market and ticker to begin.</p>
+      <input id="tickerInput" class="big-input" placeholder="e.g. ASX:STO  or  NASDAQ:AAPL" autocomplete="off" />
+      <p id="tickerHint" class="hint"></p>
+      <div class="center-btn"><button id="next1" class="btn">Next</button></div>
+    </div>
+  </section>
+
+  <!-- STEP 2: Date -->
+  <section class="screen" id="screen2">
+    <div class="center-col">
+      <h1>Valuation date</h1>
+      <p class="muted">Pick any day. We derive the year, quarter and the previous four completed quarters.</p>
+      <input id="dateInput" class="big-input" type="date" />
+      <div id="periodPreview" class="period-preview"></div>
+      <div class="center-btn"><button id="next2" class="btn">Next</button></div>
+    </div>
+  </section>
+
+  <!-- STEP 3: Uploads -->
+  <section class="screen" id="screen3">
+    <div class="wide-col">
+      <h1>Upload the trailing-twelve-month document set</h1>
+      <p class="muted" id="uploadSub"></p>
+      <div id="bubbles" class="bubbles"></div>
+
+      <div id="warnBox" class="warn-box hidden">
+        <div class="warn-title">⚠ Some required data could not be extracted</div>
+        <ul id="warnList"></ul>
+        <div class="warn-actions">
+          <span class="muted">Fix by re-uploading a clearer file, or enter the values by hand.</span>
+          <button id="manualBtn" class="btn-outline">Add manual input →</button>
+        </div>
+      </div>
+
+      <div class="center-btn">
+        <button id="next3" class="btn">Compute valuation →</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 4: Manual input -->
+  <section class="screen" id="screen4">
+    <div class="wide-col">
+      <h1>Manual input</h1>
+      <p class="muted">Enter the values the OCR could not read (reporting currency, millions; per-share in cents).</p>
+      <div id="manualForm" class="manual-form"></div>
+      <div class="center-btn"><button id="next4" class="btn">Compute valuation →</button></div>
+    </div>
+  </section>
+
+  <!-- STEP 5: Summary -->
+  <section class="screen" id="screen5">
+    <div class="wide-col">
+      <div class="summary-head">
+        <h1 id="summaryTitle">Valuation summary</h1>
+        <div id="summaryMeta" class="muted"></div>
+      </div>
+      <div class="counts" id="counts"></div>
+      <div class="table-wrap">
+        <table id="resultsTable">
+          <thead>
+            <tr><th>#</th><th>Method</th><th>Section</th><th>Status</th><th>Value</th><th>Fair / share</th><th>Notes</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="intrinsicBox" class="intrinsic-box"></div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+</div>
+<script src="/app.js"></script>
