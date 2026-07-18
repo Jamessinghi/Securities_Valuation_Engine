@@ -41,7 +41,7 @@ the exact included method IDs under `triangulation.families`.
 app/
   data.py            canonical input records + accounting reconciliations
   quarters.py        date -> current quarter + previous 4 completed quarters
-  ocr/               pdfplumber extraction + field schema (+ Tesseract fallback)
+  ocr/               bounded pypdf extraction + field schema (+ Tesseract fallback)
     fields.py        canonical field schema; AU/IFRS + US-GAAP label synonyms
     extractor.py     currency/scale detection, candidate scoring, confidence
   market/            free feeds + FX: Yahoo/Stooq, Finnhub, FRED, Ken French, Damodaran
@@ -60,6 +60,14 @@ Designed to read *any* filing, not just one company's template:
   filings); for scanned documents it falls back to Tesseract OCR when
   `pytesseract` + `tesseract` + `pdf2image`/poppler are installed. If a document
   is genuinely unreadable it is reported as such rather than returning silence.
+- **Free-tier-safe large reports** — uploads are written in 1 MB chunks rather
+  than buffered in memory. Digital filings are scanned with `pypdf`, then the
+  extractor retains at most 80 high-value pages: the cover/identity pages plus
+  financial statements, equity, EPS, debt, dividend and segment-note pages and
+  their neighbours. The original and processed page counts remain auditable.
+- **Bounded OCR** — image-only PDFs are rendered one page at a time at 160 DPI
+  grayscale, with no more than 40 OCR pages per request. Images are closed
+  immediately after recognition instead of retaining a document-sized batch.
 - **Currency & scale detection** — sniffs the reporting currency (USD/AUD/GBP/…)
   and units ("in millions"/"in thousands"/"in billions") from statement headers
   and normalises every monetary figure to *millions of the reporting currency*.
@@ -304,6 +312,21 @@ Secrets exist only in Render's environment. They are never embedded in the
 GitHub Pages JavaScript. The backend accepts browser requests only from
 `https://jamessinghi.github.io` in production. Render free services can spin
 down when idle, so the first request after inactivity may take longer.
+
+### Hosted PDF resource limits
+
+The defaults are deliberately sized for a free Render instance: 50 MB per
+upload, 500 source pages, 80 retained text pages and 40 OCR pages. They can be
+changed with `MAX_UPLOAD_MB`, `MAX_PDF_PAGES`, `MAX_TEXT_PAGES` and
+`MAX_OCR_PAGES`. Exceeding a hard limit returns HTTP 413 with a specific UI
+message. Temporary uploads are deleted after extraction, including failure
+paths. A targeted extraction adds a warning such as `80/286 targeted pages`
+instead of silently pretending every page was processed.
+
+The synchronous design is intentional for the free deployment: Render's local
+filesystem is ephemeral and the service sleeps when idle, so an in-process
+background queue could lose jobs. A durable asynchronous queue should only be
+introduced together with external object storage and a persistent job store.
 
 ## Tests & linting
 

@@ -29,6 +29,10 @@ class Settings:
         "ALLOWED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").strip())
     host: str = field(default_factory=lambda: os.getenv("HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8000")))
+    max_upload_mb: int = field(default_factory=lambda: int(os.getenv("MAX_UPLOAD_MB", "50")))
+    max_pdf_pages: int = field(default_factory=lambda: int(os.getenv("MAX_PDF_PAGES", "500")))
+    max_text_pages: int = field(default_factory=lambda: int(os.getenv("MAX_TEXT_PAGES", "80")))
+    max_ocr_pages: int = field(default_factory=lambda: int(os.getenv("MAX_OCR_PAGES", "40")))
 
     @property
     def cors_origins(self) -> list[str]:

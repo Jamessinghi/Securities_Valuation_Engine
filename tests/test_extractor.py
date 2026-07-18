@@ -4,6 +4,7 @@ from app.ocr.extractor import (
     _pick_value,
     _score_candidate,
     _section_contexts,
+    _target_pages,
 )
 
 
@@ -71,3 +72,14 @@ def test_capex_ignores_lines_outside_investing_section():
     ctx = _section_contexts(lines)
     total, hits = _capex_from_investing(lines, ctx, scale=1.0)
     assert total is None and hits == 0
+
+
+def test_target_pages_prioritizes_statements_and_neighbours():
+    pages = ["cover"] + ["ordinary narrative"] * 98 + ["Statement of cash flows $million"]
+    selected = _target_pages(pages, limit=12)
+    assert selected[:8] == list(range(8))
+    assert 98 in selected and 99 in selected
+
+
+def test_target_pages_keeps_all_small_documents():
+    assert _target_pages(["a", "b", "c"], limit=10) == [0, 1, 2]

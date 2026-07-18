@@ -118,8 +118,23 @@ completeForm.addEventListener("submit", async (e) => {
 });
 
 async function api(path, opts) {
-  const r = await fetch(apiUrl(path), opts);
-  if (!r.ok) { const t = await r.text(); throw new Error(t || r.status); }
+  let r;
+  try {
+    r = await fetch(apiUrl(path), opts);
+  } catch (err) {
+    throw new Error(
+      "The extraction service disconnected. A large PDF may have exceeded the free host's resources; retry once or upload a reduced financial-statements PDF."
+    );
+  }
+  if (!r.ok) {
+    const t = await r.text();
+    let message = t;
+    try { message = JSON.parse(t).detail || t; } catch (_) { /* plain-text response */ }
+    if (r.status === 413) message = `Document limit: ${message}`;
+    else if (r.status === 422) message = `The PDF could not be extracted: ${message}`;
+    else if (r.status >= 500) message = "The extraction service failed while processing this document. Retry or upload only the financial-statement pages.";
+    throw new Error(message || `Request failed (${r.status})`);
+  }
   return r.json();
 }
 
@@ -203,6 +218,11 @@ async function uploadFile(slot, file) {
   bub.className = "bubble";
   st.innerHTML = `<span class="spinner"></span> Extracting with OCR…`;
   fl.innerHTML = "";
+  if (file.size > 50 * 1024 * 1024) {
+    st.className = "status warn";
+    st.textContent = "Document limit: PDF exceeds the 50 MB upload limit.";
+    return;
+  }
   const fd = new FormData();
   fd.append("file", file);
   fd.append("doc_type", bub.dataset.dt);
@@ -218,11 +238,16 @@ async function uploadFile(slot, file) {
     } else {
       bub.classList.add("ok");
       st.className = "status ok";
-      st.innerHTML = `✓ ${res.filename} · ${nFields} fields extracted
+      st.innerHTML = `✓ ${res.filename} · ${nFields} fields extracted${
+        res.pages_processed < res.pages ? ` · ${res.pages_processed}/${res.pages} targeted pages` : ""
+      }
         <div class="reupload" data-slot="${slot}">↻ Replace</div>`;
     }
     fl.innerHTML = Object.entries(res.fields || {}).slice(0, 8)
       .map(([k, v]) => `${k}: ${Number(v.value).toLocaleString()}`).join(" · ");
+    if (res.warnings?.length) {
+      fl.innerHTML += `<div class="muted">${res.warnings.join(" · ")}</div>`;
+    }
     $(`.reupload[data-slot="${slot}"]`)?.addEventListener("click", () => $(`.file-in[data-slot="${slot}"]`).click());
   } catch (err) {
     st.className = "status warn"; st.textContent = "Extraction failed: " + err.message;

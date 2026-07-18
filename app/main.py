@@ -17,6 +17,7 @@ from .export import build_jpeg, build_pdf
 from .market import market_snapshot
 from .market.feeds import fx_rate
 from .ocr import DOC_TYPES, extract_document
+from .ocr.extractor import PdfLimitError
 from .quarters import resolve_period
 from .valuation import run_valuation
 from .valuation.engine import detect_reporting_currency
@@ -42,7 +43,7 @@ def health():
 @app.get("/api/config")
 def api_config():
     return {
-        "keys": settings.status(),  # {finnhub: bool, fred: bool} — never the values
+        "keys": settings.status(),  # provider availability only — never secret values
         "markets": ["ASX", "NASDAQ", "NYSE", "LSE", "TSX", "HKEX", "NSE"],
         "doc_types": [{"key": d.key, "label": d.label,
                        "required": list(d.required)} for d in DOC_TYPES],
@@ -65,15 +66,35 @@ def api_period(body: PeriodIn):
 @app.post("/api/extract")
 async def api_extract(file: UploadFile = File(...), doc_type: str = Form("")):
     suffix = Path(file.filename or "upload.pdf").suffix or ".pdf"
+    if suffix.lower() != ".pdf":
+        raise HTTPException(415, "Only PDF documents are supported")
     dest = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
-    dest.write_bytes(await file.read())
     try:
-        res = extract_document(dest, doc_type=doc_type or None)
+        limit = settings.max_upload_mb * 1024 * 1024
+        size = 0
+        with dest.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(
+                        413, f"PDF exceeds the {settings.max_upload_mb} MB upload limit")
+                output.write(chunk)
+        res = extract_document(
+            dest, doc_type=doc_type or None,
+            max_pages=settings.max_pdf_pages,
+            max_text_pages=settings.max_text_pages,
+            max_ocr_pages=settings.max_ocr_pages)
+    except PdfLimitError as e:
+        raise HTTPException(413, str(e)) from e
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(422, f"Extraction failed: {type(e).__name__}: {e}") from e
+    finally:
+        await file.close()
+        dest.unlink(missing_ok=True)
     out = res.to_dict()
     out["filename"] = file.filename or dest.name
-    out["stored_as"] = dest.name
     return out
 
 

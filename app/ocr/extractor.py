@@ -6,7 +6,7 @@ robustly as possible, and report exactly what could not be read.
 How it works
 ------------
 1. **Text layer** — digital filings (ASX Appendix 4E/4D, US 10-K/10-Q, results
-   presentations) carry a real text layer, which ``pdfplumber`` extracts
+   presentations) carry a real text layer, which ``pypdf`` extracts
    accurately. This is the primary source.
 2. **Image OCR fallback** — if a document is scanned (mostly empty text layer),
    we rasterise the pages and run Tesseract, when ``pytesseract`` + the
@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-import pdfplumber
+from pypdf import PdfReader
 
 from .fields import DOC_TYPE_BY_KEY, FIELDS, detect_doc_type
 
@@ -52,6 +52,22 @@ _PROSE = (
 _MONTHS = {name.lower(): index for index, name in enumerate(
     ("January", "February", "March", "April", "May", "June", "July", "August", "September",
      "October", "November", "December"), 1)}
+
+_PAGE_BREAK = "__SVE_PAGE_BREAK__"
+_TARGET_PAGE_TERMS = (
+    "statement of income", "income statement", "profit or loss",
+    "statement of financial position", "balance sheet",
+    "statement of cash flows", "cash flow statement",
+    "statement of changes in equity", "earnings per share",
+    "issued capital", "share capital", "weighted average number",
+    "interest-bearing loans", "borrowings", "debt maturity",
+    "dividends paid and proposed", "dividends per share",
+    "segment information", "operating segments",
+)
+
+
+class PdfLimitError(ValueError):
+    """The uploaded PDF exceeds a configured safe processing limit."""
 
 
 def _detect_period_end(lines: list[str]) -> str | None:
@@ -150,6 +166,10 @@ def _statement_contexts(lines: list[str]) -> list[str | None]:
     contexts = []
     for line in lines:
         low = line.lower().strip()
+        if low == _PAGE_BREAK.lower():
+            current = None
+            contexts.append(None)
+            continue
         for section, patterns in _STATEMENT_HEADINGS:
             if any(re.search(pattern, low) for pattern in patterns):
                 current = section
@@ -212,6 +232,10 @@ def _section_contexts(lines: list[str]) -> list[str | None]:
     current: str | None = None
     for line in lines:
         low = line.lower()
+        if low.strip() == _PAGE_BREAK.lower():
+            current = None
+            tags.append(None)
+            continue
         for tag, pats in _CF_SECTIONS:
             if any(re.search(p, low) for p in pats):
                 current = tag
@@ -373,6 +397,8 @@ class DocResult:
     scale_to_millions: float = 1.0 # multiplier applied to raw monetary figures
     period_end: str | None = None
     as_of_date: str | None = None
+    pages_processed: int | None = None
+    warnings: list[str] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -387,50 +413,113 @@ class DocResult:
             "scale_to_millions": self.scale_to_millions,
             "period_end": self.period_end,
             "as_of_date": self.as_of_date,
+            "pages_processed": self.pages_processed if self.pages_processed is not None else self.pages,
+            "warnings": self.warnings or [],
             "ok": not self.missing_required,
         }
 
 
-def _read_text(path: Path) -> tuple[list[str], int, str]:
-    """Return (lines, page_count, method)."""
-    lines: list[str] = []
-    method = "text"
-    with pdfplumber.open(str(path)) as pdf:
-        n = len(pdf.pages)
-        empty_pages = 0
-        for pg in pdf.pages:
-            txt = pg.extract_text() or ""
-            if not txt.strip():
-                empty_pages += 1
-            lines.extend(txt.split("\n"))
-    # If the doc looks scanned (mostly empty text), try OCR fallback.
+def _target_pages(page_text: list[str], limit: int) -> list[int]:
+    """Choose high-value filing pages and their neighbours within ``limit``.
+
+    Annual reports repeat financial-statement headings reliably.  Keeping the
+    first pages plus the pages around those headings captures identity, units,
+    primary statements and relevant notes without retaining hundreds of PDF
+    page objects in a small production instance.
+    """
+    n = len(page_text)
+    if n <= limit:
+        return list(range(n))
+    selected = set(range(min(8, n)))
+    scored: list[tuple[int, int]] = []
+    for idx, text in enumerate(page_text):
+        low = text.lower()
+        score = sum(3 for term in _TARGET_PAGE_TERMS if term in low)
+        score += sum(1 for term in ("$million", "usd million", "aud million", "notes to the financial")
+                     if term in low)
+        if score:
+            scored.append((score, idx))
+    for _, idx in sorted(scored, key=lambda item: (-item[0], item[1])):
+        for page_idx in (idx - 1, idx, idx + 1):
+            if 0 <= page_idx < n and len(selected) < limit:
+                selected.add(page_idx)
+        if len(selected) >= limit:
+            break
+    return sorted(selected)
+
+
+def _read_text(path: Path, max_pages: int = 500,
+               max_text_pages: int = 80, max_ocr_pages: int = 40,
+               ) -> tuple[list[str], int, str, int, list[str]]:
+    """Return bounded text without retaining heavyweight page render state."""
+    reader = PdfReader(str(path), strict=False)
+    n = len(reader.pages)
+    if n > max_pages:
+        raise PdfLimitError(f"PDF has {n} pages; the safe limit is {max_pages} pages")
+
+    page_text: list[str] = []
+    empty_pages = 0
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        if not text.strip():
+            empty_pages += 1
+        page_text.append(text)
+
+    warnings: list[str] = []
+    selected = _target_pages(page_text, max_text_pages)
+    if len(selected) < n:
+        warnings.append(f"Targeted {len(selected)} of {n} pages to stay within hosting limits")
+
+    # A mostly image-only filing needs OCR. Rasterise only a bounded page set,
+    # one page at a time, at a modest DPI; never materialise the whole PDF.
     if n and empty_pages / n > 0.6:
-        ocr_lines = _ocr_fallback(path)
+        ocr_pages = selected[:max_ocr_pages]
+        ocr_lines = _ocr_fallback(path, ocr_pages)
         if ocr_lines:
-            return ocr_lines, n, "ocr"
-    return lines, n, method
+            if len(ocr_pages) < n:
+                warnings.append(f"OCR limited to {len(ocr_pages)} of {n} pages")
+            return ocr_lines, n, "ocr", len(ocr_pages), warnings
+        warnings.append("Image-only pages could not be OCR processed on this host")
+
+    lines: list[str] = []
+    for idx in selected:
+        lines.extend(page_text[idx].splitlines())
+        lines.append(_PAGE_BREAK)
+    return lines, n, "text", len(selected), warnings
 
 
-def _ocr_fallback(path: Path) -> list[str]:
+def _ocr_fallback(path: Path, page_indexes: list[int]) -> list[str]:
     try:
         import pytesseract  # noqa
         from pdf2image import convert_from_path  # noqa
     except Exception:
         return []
-    try:
-        images = convert_from_path(str(path))
-    except Exception:
-        return []
     out: list[str] = []
-    for img in images:
-        out.extend(pytesseract.image_to_string(img).split("\n"))
+    for index in page_indexes:
+        try:
+            images = convert_from_path(
+                str(path), dpi=160, first_page=index + 1,
+                last_page=index + 1, grayscale=True, thread_count=1)
+            if images:
+                out.extend(pytesseract.image_to_string(images[0]).splitlines())
+                images[0].close()
+                out.append(_PAGE_BREAK)
+        except Exception:
+            continue
     return out
 
 
-def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult:
+def extract_document(path: str | Path, doc_type: str | None = None,
+                     *, max_pages: int = 500, max_text_pages: int = 80,
+                     max_ocr_pages: int = 40) -> DocResult:
     """Extract canonical fields from one PDF and report what's missing."""
     path = Path(path)
-    lines, n, method = _read_text(path)
+    lines, n, method, pages_processed, warnings = _read_text(
+        path, max_pages=max_pages, max_text_pages=max_text_pages,
+        max_ocr_pages=max_ocr_pages)
     dtype = doc_type or detect_doc_type(path.name)
     dt = DOC_TYPE_BY_KEY.get(dtype, DOC_TYPE_BY_KEY["other"])
 
@@ -504,4 +593,6 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
         scale_to_millions=scale,
         period_end=period_end,
         as_of_date=period_end,
+        pages_processed=pages_processed,
+        warnings=warnings,
     )
