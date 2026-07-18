@@ -57,6 +57,15 @@ Designed to read *any* filing, not just one company's template:
   rows beat prose, tables of contents and footnotes; note references ("2.5") and
   footnote markers (the "1" in "EBITDAX1") are stripped, and bare years in prose
   are penalised. Each extracted value carries a `high`/`medium`/`low` confidence.
+- **Cash-flow-aware CapEx & FCF** — each line is tagged with its cash-flow
+  sub-section (operating / investing / financing), so CapEx is taken from the
+  *investing-activities* outflows (summed across split rows such as "Oil and gas
+  assets", "Exploration and evaluation assets", "Property, plant and equipment"
+  under a "Payments for:" header) rather than a stray "capital expenditure"
+  mention in prose or a note index. The DCF then uses genuine operating cash
+  flow − CapEx instead of proxying CapEx by depreciation; where a company also
+  states a (non-IFRS) free cash flow figure it is captured and shown as a
+  cross-check in the method notes.
 - **Never silently wrong** — a field the engine can't read with confidence is
   omitted and listed in `missing_required`, which drives the UI's
   "exactly what's missing" warning + re-upload / manual-entry paths.
@@ -71,6 +80,23 @@ Designed to read *any* filing, not just one company's template:
    front, so all 65 methods, the triangulated intrinsic value, and the price
    comparison are in one currency. Rates, ratios and share counts are never
    FX-scaled. The FX rate used is shown on the summary screen and in exports.
+
+### Free-cash-flow input priority
+
+DCF, FCF-yield, Gordon terminal-value, and reverse-DCF methods use one consistent
+FCF input, in this order:
+
+1. Cash flow from operating activities minus cash-flow-statement CapEx.
+2. Operating cash flow minus D&A only when reliable CapEx was not extracted;
+   affected methods explicitly label this as a proxy.
+3. Company-reported FCF only when operating cash flow is unavailable, because
+   reported FCF is commonly a non-IFRS/non-GAAP measure. When both statement
+   inputs and reported FCF exist, the latter is displayed only as a cross-check.
+
+CapEx is normalised to a positive outflow magnitude before subtraction and is
+rejected if it is implausibly large relative to operating cash flow or revenue.
+All monetary components are converted from the reporting currency to AUD using
+the same valuation-date FX multiplier before FCF is calculated.
 
 ## Free data sources
 
@@ -112,7 +138,7 @@ Then open http://127.0.0.1:8000.
 ## Tests & linting
 
 ```bash
-./.venv/bin/python -m pytest tests/ -q     # unit tests (quarters, extractor)
+./.venv/bin/python -m pytest tests/ -q     # quarters, extraction, FCF valuation
 ./.venv/bin/ruff check app tests           # lint (config in pyproject.toml)
 ```
 

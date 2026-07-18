@@ -102,9 +102,22 @@ class Ctx:
         self.disc_disclosed = (_g(f, "discount_rate") / 100.0) if _g(f, "discount_rate") is not None else None
         self.grant_vol = (_g(f, "grant_volatility") / 100.0) if _g(f, "grant_volatility") is not None else None
 
-        # capex: only trust a magnitude plausible for a full company statement
-        capex = _g(f, "capex")
-        self.capex = _cvt(capex, fxm) if (capex and abs(capex) > 200) else None
+        # CapEx is a cash outflow — often printed in parentheses, so it parses
+        # negative. Store it as a positive magnitude (so "+ D&A − CapEx" is
+        # correct), and only trust a figure that is plausible relative to
+        # operating cash flow / revenue, so a stray line can't distort the DCF.
+        _capex = _g(f, "capex")
+        self.capex = None
+        if _capex is not None:
+            mag = abs(_capex)
+            _ocf, _rev = _g(f, "op_cash_flow"), _g(f, "revenue")
+            ceiling = abs(_ocf) * 3 if _ocf else (abs(_rev) if _rev else None)
+            if mag > 1 and (ceiling is None or mag <= ceiling):
+                self.capex = _cvt(mag, fxm)
+
+        # Directly-reported free cash flow (results presentations often state it).
+        _fcf = _g(f, "free_cash_flow")
+        self.reported_fcf = _cvt(_fcf, fxm) if _fcf is not None else None
 
         # --- shares ---
         self.shares = _g(f, "wtd_avg_shares") or m.get("shares_outstanding")
@@ -155,6 +168,30 @@ class Ctx:
         if value_m is None or not self.shares:
             return None
         return value_m * 1_000_000 / self.shares
+
+    def free_cash_flow(self) -> float | None:
+        """Best available free cash flow, in target-currency millions.
+
+        Priority favours rigour: (1) operating cash flow − CapEx, both taken
+        straight from the cash-flow statement; (2) operating cash flow − D&A as
+        a last-resort proxy when CapEx couldn't be extracted; (3) the company's
+        reported (often non-IFRS) FCF only when operating cash flow is missing.
+        Returns None when nothing is available.
+        """
+        if self.op_cf is not None:
+            capex = self.capex if self.capex is not None else (self.dna or 0)
+            return self.op_cf - capex
+        return self.reported_fcf
+
+    def fcf_note(self) -> str:
+        """Describe how ``free_cash_flow()`` was derived (for method notes)."""
+        if self.op_cf is None:
+            return "company-reported free cash flow"
+        base = ("operating cash flow − CapEx" if self.capex is not None
+                else "operating cash flow − D&A (CapEx not extracted; proxy)")
+        if self.reported_fcf is not None:
+            base += f"; cf. company-reported FCF {self.reported_fcf:,.0f}"
+        return base
 
     def fx_note(self) -> str:
         """Trailing note flagging any residual currency mismatch.
@@ -212,13 +249,13 @@ def _fcfe(ctx: Ctx, spec):
     ke = ctx.cost_equity
     if ke is None:
         return _mk(spec, status="na", missing=["cost of equity (beta/ERP or disclosed rate)"])
-    capex = ctx.capex if ctx.capex is not None else (ctx.dna or 0)
-    fcfe0 = ctx.op_cf - capex
+    fcfe0 = ctx.free_cash_flow()
     val = _two_stage_pv(fcfe0, ctx.g_high, ctx.g_term, ke, ctx.horizon)
     if val is None:
         return _mk(spec, status="na", note="Cost of equity must exceed terminal growth.")
     return _mk(spec, status="partial", value=val, unit=f"{ctx.currency}m equity",
-               intrinsic_ps=ctx.per_share(val), note=f"FCFE 2-stage, ke={ke:.1%}." + ctx.fx_note())
+               intrinsic_ps=ctx.per_share(val),
+               note=f"FCFE 2-stage, ke={ke:.1%}; {ctx.fcf_note()}." + ctx.fx_note())
 
 
 def _ddm_gordon(ctx: Ctx, spec):
@@ -420,14 +457,11 @@ def _div_yield(ctx: Ctx, spec):
 
 
 def _fcf_yield(ctx: Ctx, spec):
-    fcf = None
-    if ctx.op_cf is not None:
-        capex = ctx.capex if ctx.capex is not None else (ctx.dna or 0)
-        fcf = ctx.op_cf - capex
+    fcf = ctx.free_cash_flow()
     if fcf is None or not ctx.market_cap:
         return _mk(spec, status="na", missing=["FCF", "market cap"])
     return _mk(spec, status="ok", value=fcf / ctx.market_cap, unit="yield",
-               note="FCF / market cap.")
+               note=f"{ctx.fcf_note()} / market cap.")
 
 
 def _precedent(ctx, spec):
@@ -681,10 +715,9 @@ def _scenario(ctx: Ctx, spec):
 
 
 def _reverse_dcf(ctx: Ctx, spec):
-    if ctx.price is None or ctx.op_cf is None or not ctx.wacc or not ctx.shares:
+    fcf0 = ctx.free_cash_flow()
+    if ctx.price is None or fcf0 is None or not ctx.wacc or not ctx.shares:
         return _mk(spec, status="na", missing=["price", "FCF", "WACC"])
-    capex = ctx.capex if ctx.capex is not None else (ctx.dna or 0)
-    fcf0 = ctx.op_cf - capex
     mcap = ctx.price * ctx.shares / 1_000_000
     # implied perpetuity growth from price: mcap = fcf0*(1+g)/(wacc-g)
     denom = mcap + fcf0
@@ -735,13 +768,12 @@ def _exit_multiple_tv(ctx: Ctx, spec):
 
 
 def _gordon_tv(ctx: Ctx, spec):
-    if ctx.op_cf is None or not ctx.wacc or ctx.wacc <= ctx.g_term:
+    fcf = ctx.free_cash_flow()
+    if fcf is None or not ctx.wacc or ctx.wacc <= ctx.g_term:
         return _mk(spec, status="na", missing=["FCF", "WACC>g"])
-    capex = ctx.capex if ctx.capex is not None else (ctx.dna or 0)
-    fcf = ctx.op_cf - capex
     tv = fcf * (1 + ctx.g_term) / (ctx.wacc - ctx.g_term)
     return _mk(spec, status="partial", value=tv, unit=f"{ctx.currency}m",
-               note=f"Terminal value = FCF(1+g)/(WACC−g), g={ctx.g_term:.1%}.")
+               note=f"Terminal value = FCF(1+g)/(WACC−g), g={ctx.g_term:.1%}; {ctx.fcf_note()}.")
 
 
 def _fcff_perpetuity(ctx: Ctx, spec):

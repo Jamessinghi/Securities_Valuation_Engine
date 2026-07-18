@@ -68,6 +68,91 @@ _SCALE_MARKERS = (
     (1.0, (r"in millions", r"\$\s?m\b", r"\bmillion", r"\$'?m\b", r"us\$million", r"a\$million")),
 )
 
+# --------------------------------------------------------------------------- #
+#  Cash-flow-statement section context                                          #
+# --------------------------------------------------------------------------- #
+# Sub-headings inside a statement of cash flows. Knowing which section a line
+# sits under lets us pull CapEx from *investing* activities (not, say, an
+# income-statement depreciation line) and operating cash flow from *operating*
+# activities — so the DCF uses genuine cash-flow figures rather than proxies.
+_CF_SECTIONS = (
+    ("cf_operating", (r"cash flows? (?:from|used in|provided by|(?:relating|related) to) operating",
+                      r"^\s*(?:net )?cash (?:flows? )?from operating activities")),
+    ("cf_investing", (r"cash flows? (?:from|used in|provided by|(?:relating|related) to) investing",
+                      r"investing activities")),
+    ("cf_financing", (r"cash flows? (?:from|used in|provided by|(?:relating|related) to) financing",
+                      r"financing activities")),
+)
+
+# Which section each cash-flow field should be found under.
+_FIELD_SECTION = {
+    "capex": "cf_investing",
+    "op_cash_flow": "cf_operating",
+    "dividends_paid": "cf_financing",
+}
+
+
+# Capital-expenditure component lines as they appear inside the investing
+# section (a filing often splits CapEx across several rows under "Payments for:"
+# rather than a single "capital expenditure" total). Summing the outflows gives
+# genuine cash-flow CapEx for the DCF instead of a D&A proxy.
+_CAPEX_ITEM_PATS = (
+    r"oil and gas assets",
+    r"exploration and evaluation",
+    r"property,? plant (?:and|&) equipment",
+    r"land,? buildings,? plant",
+    r"mine properties",
+    r"development (?:expenditure|assets|wells)",
+    r"evaluation assets",
+    r"intangible assets",
+    r"capital(?:ised)? exploration",
+)
+
+
+def _capex_from_investing(lines: list[str], contexts: list[str | None],
+                          scale: float) -> tuple[float | None, int]:
+    """Sum PP&E / E&E cash outflows within the investing-activities section.
+
+    Only negative (outflow) values of recognised CapEx component lines are
+    counted, so proceeds, loans and acquisitions are excluded. Returns
+    ``(total_in_millions, line_count)`` or ``(None, 0)`` when nothing matches.
+    """
+    total = 0.0
+    hits = 0
+    for idx, line in enumerate(lines):
+        if contexts[idx] != "cf_investing":
+            continue
+        low = line.lower()
+        if not any(re.search(p, low) for p in _CAPEX_ITEM_PATS):
+            continue
+        val = _pick_value(line)
+        if val is None or val >= 0:   # capex is a cash outflow (negative)
+            continue
+        total += abs(val)
+        hits += 1
+    if hits:
+        return total * scale, hits
+    return None, 0
+
+
+def _section_contexts(lines: list[str]) -> list[str | None]:
+    """Tag each line with the cash-flow sub-section currently in force.
+
+    Walks the document top-to-bottom; when a line matches a section heading the
+    tag carries forward to subsequent lines until the next heading. Lines before
+    any cash-flow heading (or in other statements) are tagged ``None``.
+    """
+    tags: list[str | None] = []
+    current: str | None = None
+    for line in lines:
+        low = line.lower()
+        for tag, pats in _CF_SECTIONS:
+            if any(re.search(p, low) for p in pats):
+                current = tag
+                break
+        tags.append(current)
+    return tags
+
 
 def detect_currency_and_scale(text: str) -> tuple[str | None, float]:
     """Sniff (reporting_currency, scale_to_millions) from statement text.
@@ -151,10 +236,23 @@ def _pick_value(tail: str) -> float | None:
     return None
 
 
-def _score_candidate(line: str, tail: str, is_rate: bool, value: float | None) -> int:
+def _score_candidate(line: str, tail: str, is_rate: bool, value: float | None,
+                     field_key: str = "", context: str | None = None) -> int:
     """Higher = more likely to be a genuine statement row for this field."""
     low = (line + " " + tail).lower()
     score = 0
+    # Cash-flow fields: strongly prefer a candidate sitting under the expected
+    # cash-flow sub-section (e.g. CapEx under "investing activities"), and
+    # penalise one found elsewhere (a stray "capital expenditure" in prose or a
+    # commentary table). This is what makes the DCF use real CapEx, not a proxy.
+    want_section = _FIELD_SECTION.get(field_key)
+    if want_section:
+        if context == want_section:
+            score += 5
+        elif context is None:
+            score -= 3          # not under any cash-flow heading — likely prose
+        else:
+            score -= 2          # under the wrong cash-flow section
     # A bare 4-digit year in prose (e.g. "During 2025") is almost never the
     # figure we want. A real $2,025m figure carries a thousands comma, so only
     # penalise the comma-less year form.
@@ -264,6 +362,8 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
 
     # Detect currency + scale from the whole document (headers repeat the unit).
     currency, scale = detect_currency_and_scale("\n".join(lines))
+    # Tag each line with its cash-flow sub-section for CapEx/op-CF/dividends.
+    contexts = _section_contexts(lines)
 
     found: dict[str, dict] = {}
     for f in FIELDS:
@@ -283,7 +383,8 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
                     val = _pick_value(tail)
                 if val is None:
                     continue
-                candidates.append((_score_candidate(line, tail, is_rate, val), idx, val, line.strip()[:160]))
+                score = _score_candidate(line, tail, is_rate, val, field_key=f.key, context=contexts[idx])
+                candidates.append((score, idx, val, line.strip()[:160]))
                 break
         if not candidates:
             continue
@@ -294,6 +395,19 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
         if f.is_monetary and scale != 1.0:
             value = value * scale
         found[f.key] = {"value": value, "raw": raw, "line": idx, "confidence": _confidence(score)}
+
+    # Prefer genuine cash-flow CapEx: sum the investing-activities PP&E/E&E
+    # outflows. This overrides a single-line match that may be a note reference
+    # (e.g. "Capital expenditure, operating assets 7.1"), giving the DCF a real
+    # CapEx figure rather than a D&A proxy.
+    capex_cf, capex_hits = _capex_from_investing(lines, contexts, scale)
+    if capex_cf is not None:
+        found["capex"] = {
+            "value": capex_cf,
+            "raw": f"Σ {capex_hits} investing-activities PP&E/E&E outflow line(s)",
+            "line": -1,
+            "confidence": "high" if capex_hits >= 2 else "medium",
+        }
 
     missing = [
         {"key": req, "label": next(fl.label for fl in FIELDS if fl.key == req)}
