@@ -281,8 +281,8 @@ The production deployment is intentionally split because GitHub Pages serves
 static files and cannot execute the Python/FastAPI calculation engine.
 
 - Frontend: `https://jamessinghi.github.io/Securities_Valuation_Engine/`
-- Backend: `https://jamessinghi-securities-valuation-engine.onrender.com`
-- Health check: `https://jamessinghi-securities-valuation-engine.onrender.com/health`
+- Backend: `https://jamessinghi-securities-valuation-engine-yjua.onrender.com`
+- Health check: `https://jamessinghi-securities-valuation-engine-yjua.onrender.com/health`
 
 The workflow at `.github/workflows/deploy-pages.yml` publishes `app/static/`
 after relevant pushes to `main`. Static assets use relative URLs so the site
