@@ -24,6 +24,7 @@ EXPORT_DIR.mkdir(exist_ok=True)
 class Settings:
     finnhub_api_key: str = field(default_factory=lambda: os.getenv("FINNHUB_API_KEY", "").strip())
     fred_api_key: str = field(default_factory=lambda: os.getenv("FRED_API_KEY", "").strip())
+    eodhd_api_key: str = field(default_factory=lambda: os.getenv("EODHD_API_KEY", "").strip())
     host: str = field(default_factory=lambda: os.getenv("HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8000")))
 
@@ -32,6 +33,7 @@ class Settings:
         return {
             "finnhub": bool(self.finnhub_api_key),
             "fred": bool(self.fred_api_key),
+            "eodhd": bool(self.eodhd_api_key),
         }
 
 

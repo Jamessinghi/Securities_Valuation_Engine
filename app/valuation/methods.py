@@ -27,6 +27,7 @@ class MethodResult:
     note: str = ""
     missing: list[str] = field(default_factory=list)
     intrinsic_ps: float | None = None
+    completion: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -63,6 +64,8 @@ class Ctx:
                  g_high: float = 0.05, g_term: float = 0.025, horizon: int = 5):
         f = fundamentals or {}
         m = market or {}
+        self.canonical_fundamentals = f
+        self.canonical_market = m.get("canonical_inputs") or {}
         self.currency = currency                       # target/display currency
         self.reporting_currency = reporting_currency or currency
         self.fx = fx if fx else 1.0                    # reporting_currency -> currency
@@ -90,7 +93,14 @@ class Ctx:
         self.total_liabilities = _cvt(_g(f, "total_liabilities"), fxm)
         self.total_current_liabilities = _cvt(_g(f, "total_current_liabilities"), fxm)
         self.cash = _cvt(_g(f, "cash"), fxm)
-        self.total_debt = _cvt(_g(f, "borrowings_current"), fxm)
+        debt = _g(f, "borrowings_total")
+        if debt is None:
+            current_debt, noncurrent_debt = _g(f, "borrowings_current"), _g(f, "borrowings_noncurrent")
+            if current_debt is not None or noncurrent_debt is not None:
+                debt = (current_debt or 0) + (noncurrent_debt or 0)
+        self.total_debt = _cvt(debt, fxm)
+        _interest = _g(f, "interest_expense")
+        self.interest_expense = _cvt(abs(_interest), fxm) if _interest is not None else None
         self.book_equity = _cvt(_g(f, "total_equity"), fxm)
         self.op_cf = _cvt(_g(f, "op_cash_flow"), fxm)
         _div = _g(f, "dividends_paid")
@@ -120,7 +130,10 @@ class Ctx:
         self.reported_fcf = _cvt(_fcf, fxm) if _fcf is not None else None
 
         # --- shares ---
-        self.shares = _g(f, "wtd_avg_shares") or m.get("shares_outstanding")
+        filing_shares = _g(f, "wtd_avg_shares")
+        # Canonical filing share counts are expressed in millions; market feeds
+        # report absolute shares. Normalize both to absolute shares.
+        self.shares = filing_shares * 1_000_000 if filing_shares is not None else m.get("shares_outstanding")
 
         # --- market ---  (price already in the traded/target currency)
         self.price = m.get("price")
@@ -134,7 +147,13 @@ class Ctx:
         self.risk_free = m.get("risk_free")
         self.erp = m.get("erp")
         self.target_mean = m.get("target_mean")
+        self.forward_eps = m.get("forward_eps")
+        self.buyback_yield = m.get("buyback_yield")
+        self.technical = m.get("technical")
+        self.factor_models = m.get("factor_models") or {}
         self.ff_factors = m.get("ff_factors")
+        self.macro_model = m.get("macro_model")
+        self.market_sources = m.get("sources") or {}
         self.market_ccy = m.get("currency", currency)
 
         # --- derived ---
@@ -152,22 +171,57 @@ class Ctx:
         if self.total_debt is not None:
             self.net_debt = self.total_debt - (self.cash or 0)
 
-        # cost of equity (CAPM) and WACC
+        # CAPM cost of equity and market-value WACC. Disclosed asset/impairment
+        # discount rates are retained only as a cross-check, never as WACC.
         self.cost_equity = None
         if self.beta is not None and self.risk_free is not None and self.erp is not None:
             self.cost_equity = self.risk_free + self.beta * self.erp
-        self.wacc = self.disc_disclosed
-        if self.wacc is None:
-            self.wacc = self.cost_equity
         if self.cost_equity is None and self.disc_disclosed is not None:
             self.cost_equity = self.disc_disclosed
             self.assumptions.append("cost of equity proxied by disclosed discount rate")
+        self.cost_debt = None
+        if self.interest_expense is not None and self.total_debt and self.total_debt > 0:
+            self.cost_debt = min(max(self.interest_expense / self.total_debt, 0.0), 0.30)
+        self.wacc = None
+        self.wacc_source = None
+        if self.cost_equity is not None and self.market_cap and self.total_debt is not None:
+            total_capital = self.market_cap + self.total_debt
+            debt_cost = self.cost_debt if self.cost_debt is not None else self.risk_free
+            if total_capital > 0 and debt_cost is not None:
+                self.wacc = (
+                    self.market_cap / total_capital * self.cost_equity
+                    + self.total_debt / total_capital * debt_cost * (1 - self.tax_rate)
+                )
+                self.wacc_source = "calculated market-value WACC"
+                self.assumptions.append("WACC calculated from market-value capital weights")
+        if self.wacc is None and self.cost_equity is not None and not self.total_debt:
+            self.wacc = self.cost_equity
+            self.wacc_source = "all-equity CAPM"
+            self.assumptions.append("WACC equals cost of equity because debt was unavailable or zero")
+        # Explicit row-completion entries are already normalized to decimals by
+        # the API and intentionally override derived/feed values.
+        if m.get("cost_equity") is not None:
+            self.cost_equity = float(m["cost_equity"])
+        if m.get("wacc") is not None:
+            self.wacc = float(m["wacc"])
+            self.wacc_source = "manual override"
 
     # helpers
     def per_share(self, value_m: float | None) -> float | None:
         if value_m is None or not self.shares:
             return None
         return value_m * 1_000_000 / self.shares
+
+    def input_status(self, fundamental_keys: tuple[str, ...] = (), market_keys: tuple[str, ...] = ()) -> str:
+        """OK only when all material inputs are reliable and non-estimated."""
+        cells = [self.canonical_fundamentals.get(key) for key in fundamental_keys]
+        cells += [self.canonical_market.get(key) for key in market_keys]
+        cells = [cell for cell in cells if cell]
+        if not cells:
+            return "partial"
+        return "ok" if all(
+            cell.get("confidence") == "high" and not cell.get("is_estimated", False) for cell in cells
+        ) else "partial"
 
     def free_cash_flow(self) -> float | None:
         """Best available free cash flow, in target-currency millions.
@@ -239,7 +293,9 @@ def _fcff(ctx: Ctx, spec):
         return _mk(spec, status="na", missing=["WACC"], note="Needs a valid WACC > terminal growth.")
     equity = ev - (ctx.net_debt or 0)
     ps = ctx.per_share(equity)
-    return _mk(spec, status="partial", value=equity, unit=f"{ctx.currency}m EV-based equity",
+    status = ctx.input_status(("ebit", "dna", "capex", "borrowings_total"),
+                              ("beta", "risk_free", "erp", "price"))
+    return _mk(spec, status=status, value=equity, unit=f"{ctx.currency}m EV-based equity",
                intrinsic_ps=ps, note=f"2-stage; g={ctx.g_high:.0%}->{ctx.g_term:.1%}, WACC={ctx.wacc:.1%}. " + note)
 
 
@@ -253,7 +309,8 @@ def _fcfe(ctx: Ctx, spec):
     val = _two_stage_pv(fcfe0, ctx.g_high, ctx.g_term, ke, ctx.horizon)
     if val is None:
         return _mk(spec, status="na", note="Cost of equity must exceed terminal growth.")
-    return _mk(spec, status="partial", value=val, unit=f"{ctx.currency}m equity",
+    status = ctx.input_status(("op_cash_flow", "capex"), ("beta", "risk_free", "erp"))
+    return _mk(spec, status=status, value=val, unit=f"{ctx.currency}m equity",
                intrinsic_ps=ctx.per_share(val),
                note=f"FCFE 2-stage, ke={ke:.1%}; {ctx.fcf_note()}." + ctx.fx_note())
 
@@ -631,8 +688,10 @@ def _apv(ctx: Ctx, spec):
 
 def _wacc(ctx: Ctx, spec):
     if ctx.wacc:
-        src = "disclosed" if ctx.disc_disclosed else "CAPM-derived"
-        return _mk(spec, status="partial", value=ctx.wacc, unit="rate", note=f"WACC = {ctx.wacc:.2%} ({src}).")
+        status = "ok" if ctx.wacc_source == "calculated market-value WACC" and ctx.cost_debt is not None else "partial"
+        comparison = f"; disclosed asset rate {ctx.disc_disclosed:.2%}" if ctx.disc_disclosed else ""
+        return _mk(spec, status=status, value=ctx.wacc, unit="rate",
+                   note=f"WACC = {ctx.wacc:.2%} ({ctx.wacc_source or 'derived'}){comparison}.")
     return _mk(spec, status="na", missing=["cost of equity", "cost of debt", "weights"])
 
 
@@ -646,6 +705,13 @@ def _capm(ctx: Ctx, spec):
 
 def _factor_model(name):
     def fn(ctx: Ctx, spec):
+        key = {"Fama–French 3": "ff3", "Fama–French 5": "ff5", "Carhart 4": "carhart4"}.get(name)
+        model = ctx.factor_models.get(key) if key else None
+        if model:
+            loads = ", ".join(f"{k}={v:.2f}" for k, v in model["loadings"].items())
+            return _mk(spec, status="ok", value=model["expected_return"], unit="expected return",
+                       note=(f"{name} OLS on {model['observations']} aligned daily returns; "
+                             f"R²={model['r_squared']:.2f}; {loads}."))
         if ctx.ff_factors:
             return _mk(spec, status="partial", value=None, missing=["factor loadings (regression)"],
                        note=f"{name} factors loaded; needs a return regression to estimate loadings.")
@@ -655,7 +721,14 @@ def _factor_model(name):
 
 
 def _apt(ctx, spec):
-    return _mk(spec, status="na", missing=["macro-factor betas"], note="Needs multi-factor macro regression.")
+    model = ctx.macro_model
+    if not model:
+        return _mk(spec, status="na", missing=["macro-factor betas"],
+                   note="Needs sufficient point-in-time price and FRED macro history.")
+    loadings = ", ".join(f"{name}={value:.2f}" for name, value in model["loadings"].items())
+    return _mk(spec, status="ok", value=model["expected_return"], unit="expected return",
+               note=(f"APT OLS on {model['observations']} monthly observations through {model['as_of']}; "
+                     f"R²={model['r_squared']:.2f}; {loadings}."))
 
 
 def _build_up(ctx: Ctx, spec):
@@ -697,21 +770,58 @@ def _na_with(reasons, note):
 
 
 def _monte_carlo(ctx: Ctx, spec):
-    base = _fcff(ctx, spec)
-    if base.intrinsic_ps is None:
+    if ctx.ebit is None or ctx.dna is None or ctx.wacc is None or not ctx.shares:
         return _mk(spec, status="na", missing=["base DCF", "input distributions"])
-    return _mk(spec, status="partial", value=base.value, unit=f"{ctx.currency}m", intrinsic_ps=base.intrinsic_ps,
-               note="Point estimate = base DCF; wire input distributions to simulate a range.")
+    try:
+        import numpy as np
+
+        rng = np.random.default_rng(65)
+        count = 10_000
+        capex = ctx.capex if ctx.capex is not None else ctx.dna
+        base_fcf = ctx.ebit * (1 - ctx.tax_rate) + ctx.dna - capex
+        fcf = base_fcf * rng.lognormal(mean=-0.5 * 0.15 ** 2, sigma=0.15, size=count)
+        high_growth = np.clip(rng.normal(ctx.g_high, 0.025, count), -0.15, 0.20)
+        terminal_growth = np.clip(rng.normal(ctx.g_term, 0.006, count), -0.02, 0.05)
+        discount = np.clip(rng.normal(ctx.wacc, 0.0125, count), 0.03, 0.30)
+        valid = discount > terminal_growth + 0.005
+        values = []
+        for cf, growth, terminal, rate in zip(
+                fcf[valid], high_growth[valid], terminal_growth[valid], discount[valid], strict=True):
+            enterprise = _two_stage_pv(float(cf), float(growth), float(terminal), float(rate), ctx.horizon)
+            if enterprise is not None:
+                values.append(ctx.per_share(enterprise - (ctx.net_debt or 0)))
+        values = np.asarray([value for value in values if value is not None and np.isfinite(value) and value > 0])
+        if len(values) < 1000:
+            return _mk(spec, status="na", missing=["valid simulation draws"])
+        p10, p50, p90 = np.percentile(values, [10, 50, 90])
+        return _mk(spec, status="partial", value=float(p50), unit=f"{ctx.currency}/share",
+                   intrinsic_ps=float(p50),
+                   note=(f"10,000 deterministic FCFF draws; P10={p10:.2f}, median={p50:.2f}, P90={p90:.2f}; "
+                         "FCF, growth, terminal growth and WACC varied."))
+    except Exception as exc:
+        return _mk(spec, status="na", note=f"Simulation failed: {type(exc).__name__}.")
 
 
 def _scenario(ctx: Ctx, spec):
-    base = _fcff(ctx, spec)
-    if base.intrinsic_ps is None:
+    if ctx.ebit is None or ctx.dna is None or ctx.wacc is None:
         return _mk(spec, status="na", missing=["base model"])
-    lo = base.intrinsic_ps * 0.75
-    hi = base.intrinsic_ps * 1.25
-    return _mk(spec, status="partial", value=base.intrinsic_ps, unit=f"{ctx.currency}/share",
-               note=f"Bear≈{lo:.2f} / Base≈{base.intrinsic_ps:.2f} / Bull≈{hi:.2f} (±25% flex).")
+    capex = ctx.capex if ctx.capex is not None else ctx.dna
+    fcf = ctx.ebit * (1 - ctx.tax_rate) + ctx.dna - capex
+    scenarios = {
+        "bear": (ctx.g_high - 0.03, ctx.g_term - 0.005, ctx.wacc + 0.015),
+        "base": (ctx.g_high, ctx.g_term, ctx.wacc),
+        "bull": (ctx.g_high + 0.03, ctx.g_term + 0.005, max(ctx.wacc - 0.015, ctx.g_term + 0.01)),
+    }
+    per_share = {}
+    for name, (growth, terminal, rate) in scenarios.items():
+        enterprise = _two_stage_pv(fcf, growth, terminal, rate, ctx.horizon)
+        per_share[name] = ctx.per_share(enterprise - (ctx.net_debt or 0)) if enterprise is not None else None
+    if per_share["base"] is None:
+        return _mk(spec, status="na", missing=["valid base scenario"])
+    return _mk(spec, status="partial", value=per_share["base"], unit=f"{ctx.currency}/share",
+               intrinsic_ps=per_share["base"],
+               note=(f"Bear={per_share['bear']:.2f} / Base={per_share['base']:.2f} / "
+                     f"Bull={per_share['bull']:.2f}; growth ±3pp, terminal growth ±0.5pp, WACC ∓1.5pp."))
 
 
 def _reverse_dcf(ctx: Ctx, spec):
@@ -729,26 +839,33 @@ def _reverse_dcf(ctx: Ctx, spec):
 
 
 def _icc(ctx: Ctx, spec):
-    if ctx.price is None or ctx.eps is None or ctx.price == 0:
+    earnings = ctx.forward_eps if ctx.forward_eps is not None else ctx.eps
+    if ctx.price is None or earnings is None or ctx.price == 0:
         return _mk(spec, status="na", missing=["price", "forward earnings"])
     # single-stage ICC proxy: r = E1/P + g
-    r = ctx.eps / ctx.price + ctx.g_term
-    return _mk(spec, status="partial", value=r, unit="rate",
-               note="Implied cost of capital ≈ E/P + g (needs forecast EPS for precision)." + ctx.fx_note())
+    r = earnings / ctx.price + ctx.g_term
+    source = "forward EPS" if ctx.forward_eps is not None else "trailing EPS proxy"
+    return _mk(spec, status="ok" if ctx.forward_eps is not None else "partial", value=r, unit="rate",
+               note=f"Implied cost of capital ≈ E1/P + g using {source}." + ctx.fx_note())
 
 
 def _total_yield(ctx: Ctx, spec):
     if ctx.dps is None or ctx.price in (None, 0):
         return _mk(spec, status="na", missing=["DPS", "price", "buybacks"])
     dy = ctx.dps / ctx.price
-    return _mk(spec, status="ok", value=dy, unit="yield",
-               note="Dividend yield shown; add buyback $ / market cap for total shareholder yield." + ctx.fx_note())
+    if ctx.buyback_yield is None:
+        return _mk(spec, status="partial", value=dy, unit="yield", missing=["buybacks"],
+                   note="Dividend yield shown; buyback yield unavailable." + ctx.fx_note())
+    total = dy + ctx.buyback_yield
+    return _mk(spec, status="ok", value=total, unit="yield",
+               note=f"Dividend yield {dy:.2%} + buyback yield {ctx.buyback_yield:.2%}." + ctx.fx_note())
 
 
 def _analyst_targets(ctx: Ctx, spec):
     if ctx.target_mean:
+        source = "Finnhub" if ctx.market_sources.get("consensus") else "Yahoo Finance"
         return _mk(spec, status="ok", value=ctx.target_mean, unit=f"{ctx.market_ccy}/share",
-                   intrinsic_ps=ctx.target_mean, note="Finnhub consensus mean target.")
+                   intrinsic_ps=ctx.target_mean, note=f"{source} consensus mean target.")
     return _mk(spec, status="na", missing=["analyst consensus (Finnhub key)"])
 
 
@@ -799,13 +916,37 @@ def _efficient_price(ctx: Ctx, spec):
 
 
 def _technical(ctx, spec):
-    return _mk(spec, status="na", missing=["full daily price series"],
-              note="Available from the price API — run SMA/RSI/MACD over the series.")
+    t = ctx.technical
+    if not t:
+        return _mk(spec, status="na", missing=["full daily price series"],
+                   note="Needs sufficient dated daily closes on/before the valuation date.")
+    signals = []
+    if t.get("sma_50") is not None:
+        signals.append("above 50-day SMA" if t["close"] >= t["sma_50"] else "below 50-day SMA")
+    if t.get("sma_200") is not None:
+        signals.append("above 200-day SMA" if t["close"] >= t["sma_200"] else "below 200-day SMA")
+    if t.get("rsi_14") is not None:
+        signals.append(f"RSI(14)={t['rsi_14']:.1f}")
+    signals.append("MACD positive" if t["macd"] >= t["macd_signal"] else "MACD negative")
+    score_inputs = [t["macd"] >= t["macd_signal"]]
+    if t.get("sma_50") is not None:
+        score_inputs.append(t["close"] >= t["sma_50"])
+    if t.get("sma_200") is not None:
+        score_inputs.append(t["close"] >= t["sma_200"])
+    score = sum(score_inputs) / len(score_inputs)
+    return _mk(spec, status="ok", value=score, unit="signal score",
+               note=f"As of {t['as_of']} ({t['observations']} closes): " + "; ".join(signals) + ".")
 
 
 def _quant(ctx, spec):
-    return _mk(spec, status="na", missing=["cross-sectional factor exposures"],
-              note="Needs a factor-model dataset (Barra/Axioma) or French factors + loadings.")
+    model = ctx.factor_models.get("ff5")
+    if not model:
+        return _mk(spec, status="na", missing=["cross-sectional factor exposures"],
+                   note="Needs sufficient aligned security and factor returns.")
+    style = max(model["loadings"].items(), key=lambda item: abs(item[1]))
+    return _mk(spec, status="partial", value=model["expected_return"], unit="factor expected return",
+               note=(f"Free-data FF5 style proxy; dominant exposure {style[0]}={style[1]:.2f}, "
+                     f"R²={model['r_squared']:.2f}. Not a proprietary Barra/Axioma cross-section."))
 
 
 # --------------------------------------------------------------------------- #

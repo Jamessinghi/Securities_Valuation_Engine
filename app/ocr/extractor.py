@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import pdfplumber
@@ -48,6 +49,32 @@ _PROSE = (
     "directors", " to ", "primarily", "represents", "typically", "between",
     "during the", "declaration", "contents",
 )
+_MONTHS = {name.lower(): index for index, name in enumerate(
+    ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+     "October", "November", "December"), 1)}
+
+
+def _detect_period_end(lines: list[str]) -> str | None:
+    """Detect a statement period end from common IFRS/US filing headings."""
+    for line in lines[: min(len(lines), 1500)]:
+        match = re.search(
+            r"ended\s+(?:on\s+)?(\d{1,2})\s+([A-Za-z]+)\s+(20\d{2})",
+            line, re.IGNORECASE)
+        if not match:
+            match = re.search(
+                r"ended\s+(?:on\s+)?([A-Za-z]+)\s+(\d{1,2}),?\s+(20\d{2})",
+                line, re.IGNORECASE)
+            if match:
+                month, day, year = match.groups()
+            else:
+                continue
+        else:
+            day, month, year = match.groups()
+        try:
+            return date(int(year), _MONTHS[month.lower()], int(day)).isoformat()
+        except (KeyError, ValueError):
+            continue
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +117,45 @@ _FIELD_SECTION = {
     "op_cash_flow": "cf_operating",
     "dividends_paid": "cf_financing",
 }
+
+_STATEMENT_HEADINGS = (
+    ("income_statement", (r"statement of (?:comprehensive )?income", r"income statement", r"profit or loss")),
+    ("balance_sheet", (r"statement of financial position", r"balance sheets?")),
+    ("cash_flow_statement", (r"statement of cash flows?", r"cash flow statements?")),
+    ("changes_in_equity", (r"statement of changes in equity", r"stockholders'? equity")),
+    ("segment_note", (r"segment information", r"operating segments?")),
+    ("debt_note", (r"interest-bearing loans and borrowings", r"borrowings and other financial liabilities")),
+    ("share_note", (r"issued capital", r"share capital", r"earnings per share")),
+    ("dividend_note", (r"dividends paid and proposed", r"dividends? per share")),
+)
+
+_FIELD_STATEMENTS = {
+    "revenue": {"income_statement", "segment_note"}, "ebit": {"income_statement"},
+    "net_profit": {"income_statement"}, "income_tax": {"income_statement"},
+    "interest_expense": {"income_statement", "debt_note"},
+    "total_assets": {"balance_sheet"}, "total_liabilities": {"balance_sheet"},
+    "total_equity": {"balance_sheet", "changes_in_equity"}, "cash": {"balance_sheet", "cash_flow_statement"},
+    "borrowings_total": {"balance_sheet", "debt_note"}, "borrowings_current": {"balance_sheet", "debt_note"},
+    "borrowings_noncurrent": {"balance_sheet", "debt_note"},
+    "eps_basic": {"share_note", "income_statement"}, "wtd_avg_shares": {"share_note"},
+    "shares_on_issue": {"changes_in_equity", "share_note"}, "dps": {"dividend_note"},
+    "op_cash_flow": {"cash_flow_statement"}, "capex": {"cash_flow_statement"},
+    "cash_opening": {"cash_flow_statement"}, "cash_movement": {"cash_flow_statement"},
+}
+
+
+def _statement_contexts(lines: list[str]) -> list[str | None]:
+    """Track the primary statement/note section for every extracted line."""
+    current = None
+    contexts = []
+    for line in lines:
+        low = line.lower().strip()
+        for section, patterns in _STATEMENT_HEADINGS:
+            if any(re.search(pattern, low) for pattern in patterns):
+                current = section
+                break
+        contexts.append(current)
+    return contexts
 
 
 # Capital-expenditure component lines as they appear inside the investing
@@ -237,7 +303,8 @@ def _pick_value(tail: str) -> float | None:
 
 
 def _score_candidate(line: str, tail: str, is_rate: bool, value: float | None,
-                     field_key: str = "", context: str | None = None) -> int:
+                     field_key: str = "", context: str | None = None,
+                     statement_context: str | None = None) -> int:
     """Higher = more likely to be a genuine statement row for this field."""
     low = (line + " " + tail).lower()
     score = 0
@@ -253,6 +320,9 @@ def _score_candidate(line: str, tail: str, is_rate: bool, value: float | None,
             score -= 3          # not under any cash-flow heading — likely prose
         else:
             score -= 2          # under the wrong cash-flow section
+    wanted_statements = _FIELD_STATEMENTS.get(field_key)
+    if wanted_statements and statement_context:
+        score += 3 if statement_context in wanted_statements else -2
     # A bare 4-digit year in prose (e.g. "During 2025") is almost never the
     # figure we want. A real $2,025m figure carries a thousands comma, so only
     # penalise the comma-less year form.
@@ -301,6 +371,8 @@ class DocResult:
     method: str = "text"           # text | ocr
     currency: str | None = None    # detected reporting currency
     scale_to_millions: float = 1.0 # multiplier applied to raw monetary figures
+    period_end: str | None = None
+    as_of_date: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -313,6 +385,8 @@ class DocResult:
             "method": self.method,
             "currency": self.currency,
             "scale_to_millions": self.scale_to_millions,
+            "period_end": self.period_end,
+            "as_of_date": self.as_of_date,
             "ok": not self.missing_required,
         }
 
@@ -362,8 +436,10 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
 
     # Detect currency + scale from the whole document (headers repeat the unit).
     currency, scale = detect_currency_and_scale("\n".join(lines))
+    period_end = _detect_period_end(lines)
     # Tag each line with its cash-flow sub-section for CapEx/op-CF/dividends.
     contexts = _section_contexts(lines)
+    statement_contexts = _statement_contexts(lines)
 
     found: dict[str, dict] = {}
     for f in FIELDS:
@@ -383,7 +459,8 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
                     val = _pick_value(tail)
                 if val is None:
                     continue
-                score = _score_candidate(line, tail, is_rate, val, field_key=f.key, context=contexts[idx])
+                score = _score_candidate(line, tail, is_rate, val, field_key=f.key, context=contexts[idx],
+                                         statement_context=statement_contexts[idx])
                 candidates.append((score, idx, val, line.strip()[:160]))
                 break
         if not candidates:
@@ -394,7 +471,8 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
         # Normalise monetary figures to millions of the reporting currency.
         if f.is_monetary and scale != 1.0:
             value = value * scale
-        found[f.key] = {"value": value, "raw": raw, "line": idx, "confidence": _confidence(score)}
+        found[f.key] = {"value": value, "raw": raw, "line": idx, "confidence": _confidence(score),
+                        "statement_section": statement_contexts[idx]}
 
     # Prefer genuine cash-flow CapEx: sum the investing-activities PP&E/E&E
     # outflows. This overrides a single-line match that may be a note reference
@@ -424,4 +502,6 @@ def extract_document(path: str | Path, doc_type: str | None = None) -> DocResult
         method=method,
         currency=currency,
         scale_to_millions=scale,
+        period_end=period_end,
+        as_of_date=period_end,
     )

@@ -56,3 +56,14 @@ def test_implausible_capex_is_rejected_before_fcf_calculation():
 
     assert ctx.capex is None
     assert ctx.free_cash_flow() == 80
+
+
+def test_explicit_rate_overrides_replace_derived_rates():
+    ctx = Ctx(
+        {},
+        market={"risk_free": 0.04, "erp": 0.05, "beta": 1.2,
+                "cost_equity": 0.0875, "wacc": 0.08},
+    )
+
+    assert ctx.cost_equity == 0.0875
+    assert ctx.wacc == 0.08

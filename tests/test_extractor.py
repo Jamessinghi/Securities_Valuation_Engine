@@ -1,9 +1,15 @@
 from app.ocr.extractor import (
     _capex_from_investing,
+    _detect_period_end,
     _pick_value,
     _score_candidate,
     _section_contexts,
 )
+
+
+def test_detects_statement_period_end():
+    assert _detect_period_end(["For the year ended 31 December 2025"]) == "2025-12-31"
+    assert _detect_period_end(["Six months ended June 30, 2025"]) == "2025-06-30"
 
 
 def test_pick_skips_note_ref():

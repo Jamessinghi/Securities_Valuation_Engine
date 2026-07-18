@@ -15,6 +15,7 @@ env/
 uploads/
 *.log
 exports/
+.cache/
 
 # OS / editor
 .DS_Store

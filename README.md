@@ -23,16 +23,29 @@ A five-step wizard:
 4. **Manual input** — type any values OCR missed.
 5. **Valuation** — all 65 methods in a scrollable table, the triangulated
    intrinsic value below it, and an **Export ▾** (PDF / JPEG) button top-right.
+   A method that still lacks an input has a **Complete?** button. Entering a
+   filing, market, rate, or specialist external result reruns all 65 methods and
+   refreshes both the affected rows and the triangulated value.
+
+The headline is the median of independent valuation-family medians, not the
+median of every row. Cash flow, dividends, residual income, justified
+fundamentals, market-relative evidence and SOTP each receive at most one vote.
+Accounting floors, ratios, standalone terminal values, market price and
+technical signals remain visible but are excluded from intrinsic triangulation;
+negative and non-finite per-share results are also excluded. The API exposes
+the exact included method IDs under `triangulation.families`.
 
 ## Architecture
 
 ```
 app/
+  data.py            canonical input records + accounting reconciliations
   quarters.py        date -> current quarter + previous 4 completed quarters
   ocr/               pdfplumber extraction + field schema (+ Tesseract fallback)
     fields.py        canonical field schema; AU/IFRS + US-GAAP label synonyms
     extractor.py     currency/scale detection, candidate scoring, confidence
   market/            free feeds + FX: Yahoo/Stooq, Finnhub, FRED, Ken French, Damodaran
+    public_sources.py SEC company facts/search, ASX research links, AQR catalog
   valuation/         the 65 methods + triangulation engine (FX -> AUD)
   export/            PDF (reportlab) + JPEG (Pillow)
   main.py            FastAPI routes
@@ -57,6 +70,10 @@ Designed to read *any* filing, not just one company's template:
   rows beat prose, tables of contents and footnotes; note references ("2.5") and
   footnote markers (the "1" in "EBITDAX1") are stripped, and bare years in prose
   are penalised. Each extracted value carries a `high`/`medium`/`low` confidence.
+- **Statement and note context** — matches are tagged and scored inside the
+  income statement, balance sheet, cash-flow statement, statement of changes
+  in equity, segment note, debt note, share/EPS note and dividend note. A label
+  in the correct statement beats the same words in narrative commentary.
 - **Cash-flow-aware CapEx & FCF** — each line is tagged with its cash-flow
   sub-section (operating / investing / financing), so CapEx is taken from the
   *investing-activities* outflows (summed across split rows such as "Oil and gas
@@ -69,6 +86,62 @@ Designed to read *any* filing, not just one company's template:
 - **Never silently wrong** — a field the engine can't read with confidence is
   omitted and listed in `missing_required`, which drives the UI's
   "exactly what's missing" warning + re-upload / manual-entry paths.
+
+### Canonical input and audit layer
+
+Every filing, manual and market observation is normalized before a valuation
+method sees it. The API returns this ledger under `data_quality.canonical_inputs`:
+
+```json
+{
+  "value": 6150,
+  "currency": "USD",
+  "units": "USD_m",
+  "period_start": "2025-01-01",
+  "period_end": "2025-12-31",
+  "as_of_date": "2026-02-20",
+  "source": "annual-report.pdf",
+  "source_type": "filing",
+  "confidence": "high",
+  "is_estimated": false
+}
+```
+
+Monetary statement inputs use millions of reporting currency, filing share
+counts use millions and are converted to absolute shares in the valuation
+context, per-share values retain their declared units, and rates are decimals
+internally. Higher-confidence observations can supersede lower-confidence
+matches while retaining an explicit source.
+
+Before calculation the engine performs these reconciliations and returns them
+under `data_quality.accounting_checks`:
+
+- assets versus liabilities plus equity;
+- opening cash plus net movement versus closing cash;
+- operating cash flow less CapEx versus reported FCF;
+- basic EPS versus attributable profit divided by weighted-average shares; and
+- total debt versus current plus non-current debt-note components.
+
+Checks use relative materiality tolerances and report `passed`, `failed`, or
+`not_tested`. Fields involved in a failed check are downgraded to low confidence,
+so dependent methods remain `PARTIAL` rather than receiving a false `OK`.
+
+### Calculated WACC
+
+The impairment-note discount rate is no longer used as corporate WACC. The
+engine calculates:
+
+```text
+cost of equity = risk-free rate + beta × equity risk premium
+pre-tax debt cost = interest expense ÷ interest-bearing debt
+WACC = E/(D+E) × cost of equity + D/(D+E) × debt cost × (1-tax rate)
+```
+
+Equity is weighted at valuation-date market value; debt uses the statement/debt
+note; the effective normalized tax rate is used when available. If debt cost is
+missing, the risk-free rate is an explicitly auditable fallback. A disclosed
+asset discount rate is shown only as a cross-check. Manual WACC remains an
+explicit override and is labelled as such.
 
 ### Currency handling (AUD)
 
@@ -102,12 +175,51 @@ the same valuation-date FX multiplier before FCF is calculated.
 
 | Need | Source | Key? |
 |------|--------|------|
-| Daily price, beta, volatility, shares | Yahoo Finance (`yfinance`), Stooq | no |
-| Analyst consensus / price targets | Finnhub | `FINNHUB_API_KEY` |
-| Risk-free yield + macro | FRED | `FRED_API_KEY` |
-| Fama-French / momentum factors | Ken French (`pandas-datareader`) | no |
+| Raw close, adjusted close, beta, volatility, shares | Yahoo Finance (`yfinance`), Stooq | no |
+| Analyst consensus / forward EPS / buybacks | Finnhub, Yahoo fallback | `FINNHUB_API_KEY` |
+| Valuation-date risk-free yield | FRED | `FRED_API_KEY` |
+| FF3 / FF5 / Carhart factors and regressions | Ken French (`pandas-datareader`) | no |
 | FX rate (reporting currency → AUD) | Yahoo Finance (`{FROM}{TO}=X`) | no |
-| Equity risk premium | Damodaran (fallback constant) | no |
+| Equity risk premium | Damodaran current workbook; dated fallback | no |
+| Recent global/ASX EOD price fallback | EODHD free tier | `EODHD_API_KEY` (optional) |
+| US peer facts and merger/proxy documents | SEC Company Facts + EDGAR full text | no |
+| ASX scheme/IER source documents | Official ASX company announcements | no |
+| Factor backup/catalog | AQR public datasets | no |
+
+The market pipeline also computes SMA(20/50/200), RSI(14), MACD and historical
+volatility from closes no later than the valuation date. Factor-model results
+are OLS regressions of the security's aligned daily excess returns on the Ken
+French factor series, with observations, loadings and R² shown in method notes.
+Stooq is a best-effort keyless fallback when Yahoo history is unavailable.
+Beta uses five years of weekly raw/adjusted-price history and applies the
+standard Blume adjustment toward 1.0; both raw and adjusted beta are retained.
+An APT-style method regresses monthly security returns against point-in-time
+FRED oil, inflation, industrial-production and term-spread factors when at
+least 36 aligned observations exist. For AUD securities, official RBA Table F2
+is a keyless fallback for the Australian Government 10-year yield.
+
+Monte Carlo is a reproducible 10,000-draw FCFF simulation rather than a renamed
+point estimate. It varies starting cash flow, high-growth rate, terminal growth
+and WACC, rejects invalid WACC/terminal-growth combinations, and reports P10,
+median and P90. Scenario analysis independently recalculates bear/base/bull
+values using explicit growth, terminal-growth and WACC shocks rather than an
+arbitrary percentage around the base price.
+Exact `(market, ticker, valuation date)` snapshots are cached in `.cache/`
+(git-ignored). Price output explicitly contains `raw_close`, `adjusted_close`,
+`price_type`, and the actual trading-day `as_of`; valuation comparisons use the
+raw close, while total-return calculations use adjusted history.
+
+### Point-in-time discipline
+
+- Prices, technical indicators, beta, volatility and FRED yields are bounded by
+  the selected valuation date.
+- Current Yahoo/Finnhub analyst targets, forward EPS and current shares are used
+  only for a current valuation. They are deliberately not backfilled into a
+  historical valuation because that would introduce look-ahead bias.
+- Historical consensus requires a paid point-in-time archive or a dated value
+  entered through the row's **Complete?** workflow.
+- Every market response includes source flags and notes; unavailable feeds do
+  not silently become zero.
 
 Everything degrades gracefully: no network or no key just leaves those methods
 marked *needs external data* — the document-based methods still run.
@@ -123,6 +235,34 @@ cp .env.example .env
 
 Nothing in the committed source contains a key; `/api/config` reports only
 whether each key is *present*, never its value.
+
+`EODHD_API_KEY` is optional. Its free plan currently provides 20 calls/day and
+one year of EOD history; the engine calls it only if Yahoo and Stooq fail and
+the valuation date is inside that free historical window. It is useful for ASX
+resilience but does not replace the five-year Yahoo history needed for beta.
+
+The FRED integration observes the provider's required attribution: “This
+product uses the FRED® API but is not endorsed or certified by the Federal
+Reserve Bank of St. Louis.”
+
+### Row-level completion and recalculation
+
+For an unavailable/partial method with explicit missing inputs, **Complete?**
+requests the normalized engine input and its unit. Common entries include:
+
+- reporting-currency millions for statement fields such as EBIT, CapEx and FCF;
+- reporting-currency cents for OCR EPS/DPS fields;
+- traded-currency price, price target or forward EPS;
+- percentages for risk-free rate, ERP, volatility, buyback yield and WACC; and
+- unitless beta or absolute share count.
+
+The API normalizes percentage and market-cap units, gives manual values explicit
+precedence over feeds, rebuilds the valuation context and runs all 65 methods.
+For methods that inherently require an external study or dataset—precedent M&A,
+replacement-cost appraisal, SOTP, or real options—the form instead accepts the
+externally calculated method value and optional fair value per share. These are
+labelled as user-supplied in the notes; only a supplied per-share value enters
+the headline triangulation.
 
 ## Run
 
@@ -144,8 +284,8 @@ Then open http://127.0.0.1:8000.
 
 ## Notes & limitations
 
-- Forecast growth and (where a WACC isn't disclosed) the discount rate are
-  **assumptions**, surfaced on the summary screen. CapEx that OCR can't reliably
+- Forecast growth remains an **assumption**, surfaced on the summary screen.
+  WACC is calculated from capital-market and statement inputs. CapEx that OCR can't reliably
   isolate is proxied by D&A (flagged per method).
 - Financials are converted from the detected reporting currency to AUD at the
   valuation-date FX rate (live from Yahoo, with a flagged fallback). If the FX

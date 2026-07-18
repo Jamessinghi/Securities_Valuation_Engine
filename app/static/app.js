@@ -4,7 +4,10 @@ const S = {
   docs: {},        // slotId -> DocResult
   slots: [],       // slot definitions
   manual: {},      // field_key -> value
+  marketOverrides: {},
+  methodOverrides: {},
   summary: null,
+  completingMethod: null,
 };
 
 const $ = (s) => document.querySelector(s);
@@ -24,6 +27,94 @@ function goto(step) {
   });
   $("#exportWrap").classList.toggle("hidden", step !== 5);
 }
+
+// ---------- More information modal ----------
+const moreInfoModal = $("#moreInfoModal");
+const moreInfoBtn = $("#moreInfoBtn");
+const closeMoreInfoBtn = $("#closeMoreInfo");
+let modalReturnFocus = null;
+
+function openMoreInfo() {
+  modalReturnFocus = document.activeElement;
+  moreInfoModal.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  closeMoreInfoBtn.focus();
+}
+
+function closeMoreInfo() {
+  moreInfoModal.classList.add("hidden");
+  document.body.classList.remove("modal-open");
+  if (modalReturnFocus instanceof HTMLElement) modalReturnFocus.focus();
+}
+
+moreInfoBtn.addEventListener("click", openMoreInfo);
+closeMoreInfoBtn.addEventListener("click", closeMoreInfo);
+moreInfoModal.addEventListener("click", (e) => {
+  if (e.target === moreInfoModal) closeMoreInfo();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !moreInfoModal.classList.contains("hidden")) closeMoreInfo();
+});
+
+// ---------- Row-level missing-input completion ----------
+const completeModal = $("#completeModal");
+const completeForm = $("#completeForm");
+const closeCompleteBtn = $("#closeComplete");
+const cancelCompleteBtn = $("#cancelComplete");
+
+function openComplete(methodId) {
+  const result = S.summary?.results?.find((r) => r.id === methodId);
+  if (!result || !result.completion?.length) return;
+  S.completingMethod = result;
+  modalReturnFocus = document.activeElement;
+  $("#completeTitle").textContent = result.name;
+  $("#completeIntro").textContent = result.missing?.length
+    ? `Still required: ${result.missing.join(", ")}.`
+    : "Supply the external information required by this method.";
+  $("#completeFields").innerHTML = result.completion.map((field, index) => `
+    <div class="completion-field">
+      <label for="completion-${index}">${field.label}</label>
+      <small>${field.unit}</small>
+      <input id="completion-${index}" type="number" step="any" inputmode="decimal"
+        data-scope="${field.scope}" data-key="${field.key}" ${field.required ? "required" : ""} />
+    </div>`).join("");
+  completeModal.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  $("#completeFields input")?.focus();
+}
+
+function closeComplete() {
+  completeModal.classList.add("hidden");
+  document.body.classList.remove("modal-open");
+  S.completingMethod = null;
+  if (modalReturnFocus instanceof HTMLElement) modalReturnFocus.focus();
+}
+
+closeCompleteBtn.addEventListener("click", closeComplete);
+cancelCompleteBtn.addEventListener("click", closeComplete);
+completeModal.addEventListener("click", (e) => { if (e.target === completeModal) closeComplete(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !completeModal.classList.contains("hidden")) closeComplete();
+});
+
+completeForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const method = S.completingMethod;
+  if (!method) return;
+  const methodEntry = {};
+  $$("#completeFields input").forEach((input) => {
+    if (input.value === "") return;
+    const value = Number(input.value);
+    if (input.dataset.scope === "manual") S.manual[input.dataset.key] = value;
+    else if (input.dataset.scope === "market") S.marketOverrides[input.dataset.key] = value;
+    else methodEntry[input.dataset.key] = value;
+  });
+  if (Object.keys(methodEntry).length) S.methodOverrides[String(method.id)] = methodEntry;
+  closeComplete();
+  await compute({preserveTable: true});
+  toast(`${method.name} updated; all methods recalculated.`);
+});
+
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) { const t = await r.text(); throw new Error(t || r.status); }
@@ -176,12 +267,13 @@ $("#next4").addEventListener("click", () => {
 });
 
 // ---------- compute + STEP 5 ----------
-async function compute() {
+async function compute({preserveTable = false} = {}) {
   goto(5);
   $("#intrinsicBox").innerHTML = `<span class="spinner"></span> Running 65 valuation methods & fetching market data…`;
-  $("#resultsTable").querySelector("tbody").innerHTML = "";
+  if (!preserveTable) $("#resultsTable").querySelector("tbody").innerHTML = "";
   try {
-    const body = { market: S.market, ticker: S.ticker, date: S.date, docs: Object.values(S.docs), manual: S.manual, use_market: true };
+    const body = {market: S.market, ticker: S.ticker, date: S.date, docs: Object.values(S.docs),
+      manual: S.manual, market_overrides: S.marketOverrides, method_overrides: S.methodOverrides, use_market: true};
     const sum = await api("/api/compute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     S.summary = sum;
     renderSummary(sum);
@@ -214,7 +306,9 @@ function renderSummary(sum) {
       <td>${fmt(r.value)}${r.unit ? " <span class='note'>" + r.unit + "</span>" : ""}</td>
       <td>${fmt(r.intrinsic_ps)}</td>
       <td class="note">${r.note || (r.missing && r.missing.length ? "needs: " + r.missing.join(", ") : "")}</td>
+      <td>${r.completion && r.completion.length ? `<button class="complete-btn" data-method-id="${r.id}">Complete?</button>` : ""}</td>
     </tr>`).join("");
+  $$(".complete-btn").forEach((button) => button.addEventListener("click", () => openComplete(Number(button.dataset.methodId))));
 
   const iv = sum.intrinsic_value_per_share, cur = sum.intrinsic_currency;
   let verdict = "";
@@ -227,7 +321,7 @@ function renderSummary(sum) {
     verdict = `<div class="verdict"><small>Add a market price (enter a valid ticker & connect API keys)<br>to compare against market.</small></div>`;
   }
   $("#intrinsicBox").innerHTML = `
-    <div><div class="lbl">Triangulated intrinsic value (median of ${sum.n_intrinsic_models} models)</div>
+    <div><div class="lbl">Triangulated intrinsic value (median of ${sum.n_intrinsic_families || 0} independent families; ${sum.n_intrinsic_models} models)</div>
       <div class="big">${cur} ${fmt(iv)} / share</div>
       ${sum.assumptions && sum.assumptions.length ? "<div class='lbl'>Assumptions: " + sum.assumptions.join("; ") + "</div>" : ""}
     </div>${verdict}`;

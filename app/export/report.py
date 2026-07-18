@@ -41,7 +41,8 @@ def build_pdf(summary: dict, meta: dict) -> bytes:
     story.append(Spacer(1, 8))
     story.append(Paragraph(
         f"<b>Triangulated intrinsic value: {ivc} {_fmt(iv)} / share</b> "
-        f"(median of {summary.get('n_intrinsic_models',0)} intrinsic models)", styles["Normal"]))
+        f"(median of {summary.get('n_intrinsic_families', 0)} independent valuation families; "
+        f"{summary.get('n_intrinsic_models', 0)} models)", styles["Normal"]))
     c = summary.get("counts", {})
     story.append(Paragraph(f"Computed: {c.get('ok',0)} full · {c.get('partial',0)} partial · "
                            f"{c.get('na',0)} needs external data", sub))
@@ -101,7 +102,8 @@ def build_jpeg(summary: dict, meta: dict) -> bytes:
                       f"{meta.get('current_label','')}", font=font(15), fill="#cbd5e1")
     iv = summary.get("intrinsic_value_per_share")
     d.text((pad, 96), f"Intrinsic value: {summary.get('intrinsic_currency','')} {_fmt(iv)} / share "
-                      f"({summary.get('n_intrinsic_models',0)} models)", font=font(18, True), fill="#4ade80")
+                      f"({summary.get('n_intrinsic_families', 0)} families; "
+                      f"{summary.get('n_intrinsic_models', 0)} models)", font=font(18, True), fill="#4ade80")
 
     cols = [(pad, "#"), (pad + 45, "Method"), (pad + 520, "Section"),
             (pad + 850, "Status"), (pad + 970, "Value"), (pad + 1080, "Fair/sh")]

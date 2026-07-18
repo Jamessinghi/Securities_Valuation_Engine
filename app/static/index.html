@@ -21,6 +21,7 @@
   <!-- STEP 1: Welcome / ticker -->
   <section class="screen active" id="screen1">
     <div class="center-col">
+      <p class="hero-kicker">James Singhi's Securties Valuator</p>
       <h1>Value any listed security</h1>
       <p class="muted">Enter the market and ticker to begin.</p>
       <input id="tickerInput" class="big-input" placeholder="e.g. ASX:STO  or  NASDAQ:AAPL" autocomplete="off" />
@@ -83,7 +84,7 @@
       <div class="table-wrap">
         <table id="resultsTable">
           <thead>
-            <tr><th>#</th><th>Method</th><th>Section</th><th>Status</th><th>Value</th><th>Fair / share</th><th>Notes</th></tr>
+            <tr><th>#</th><th>Method</th><th>Section</th><th>Status</th><th>Value</th><th>Fair / share</th><th>Notes</th><th>Input</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -91,6 +92,98 @@
       <div id="intrinsicBox" class="intrinsic-box"></div>
     </div>
   </section>
+
+  <button id="moreInfoBtn" class="more-info-btn" type="button" aria-haspopup="dialog" aria-controls="moreInfoModal">
+    More Info
+  </button>
+
+  <div id="moreInfoModal" class="modal-backdrop hidden" role="dialog" aria-modal="true"
+       aria-labelledby="moreInfoTitle" aria-describedby="moreInfoIntro">
+    <article class="info-modal">
+      <header class="info-modal-head">
+        <div>
+          <p class="modal-eyebrow">James Singhi's Securties Valuator</p>
+          <h2 id="moreInfoTitle">How the valuation engine works</h2>
+        </div>
+        <button id="closeMoreInfo" class="modal-close" type="button" aria-label="Close more information">&times;</button>
+      </header>
+
+      <div class="info-modal-body">
+        <p id="moreInfoIntro" class="info-lead">
+          This tool turns company filings and market data into a broad, auditable valuation. It extracts the
+          financial inputs, normalises them into AUD, runs 65 valuation methods, and triangulates the usable
+          per-share estimates into a single reference value.
+        </p>
+
+        <section class="info-section">
+          <h3>The five-step workflow</h3>
+          <ol class="workflow-list">
+            <li><strong>Stock</strong><span>Enter an exchange and ticker, such as ASX:STO or NASDAQ:AAPL.</span></li>
+            <li><strong>Date</strong><span>Choose the valuation date; the engine determines the applicable period and trailing four completed quarters.</span></li>
+            <li><strong>Documents</strong><span>Upload annual, half-year, results, and quarterly PDFs. Text extraction and OCR identify the required financial line items.</span></li>
+            <li><strong>Manual</strong><span>Review anything the extractor could not read confidently and enter only the missing values.</span></li>
+            <li><strong>Valuation</strong><span>Review every method, its status, assumptions, notes, fair value per share, and the triangulated result.</span></li>
+          </ol>
+        </section>
+
+        <div class="info-grid">
+          <section class="info-card">
+            <h3>Document extraction</h3>
+            <p>Statement rows are ranked above prose and note references. Cash-flow context identifies operating cash flow and investing-activity CapEx, including CapEx split across several asset rows.</p>
+          </section>
+          <section class="info-card">
+            <h3>Free cash flow</h3>
+            <p>DCF methods prefer operating cash flow minus cash-flow-statement CapEx. D&amp;A is a labelled fallback when CapEx is unavailable, while company-reported FCF is retained as a cross-check.</p>
+          </section>
+          <section class="info-card">
+            <h3>Currency consistency</h3>
+            <p>Reporting-currency amounts are converted to AUD at the valuation-date FX rate so intrinsic value can be compared directly with an AUD market price.</p>
+          </section>
+          <section class="info-card">
+            <h3>Method coverage</h3>
+            <p>The engine runs 65 approaches across cash flow, dividends, earnings, assets, multiples, returns, scenarios, terminal value, and market-implied analysis.</p>
+          </section>
+          <section class="info-card">
+            <h3>Transparent results</h3>
+            <p>Each method is marked computed, partial, or unavailable. Notes expose assumptions, proxies, missing external data, and any currency warning instead of silently filling gaps.</p>
+          </section>
+          <section class="info-card">
+            <h3>Triangulation</h3>
+            <p>The headline intrinsic value is the median of the methods that produce a usable per-share estimate, reducing dependence on any single model.</p>
+          </section>
+        </div>
+
+        <aside class="info-disclaimer">
+          <strong>Important:</strong> This is an educational valuation aid, not personalised financial advice.
+          Results depend on source-document quality, market-data availability, and model assumptions. Review the
+          underlying filings and method notes before relying on any output. This product uses the FRED&reg; API but
+          is not endorsed or certified by the Federal Reserve Bank of St. Louis.
+        </aside>
+      </div>
+    </article>
+  </div>
+
+  <div id="completeModal" class="modal-backdrop hidden" role="dialog" aria-modal="true"
+       aria-labelledby="completeTitle" aria-describedby="completeIntro">
+    <article class="completion-modal">
+      <header class="info-modal-head">
+        <div>
+          <p class="modal-eyebrow">Manual completion</p>
+          <h2 id="completeTitle">Complete valuation method</h2>
+        </div>
+        <button id="closeComplete" class="modal-close" type="button" aria-label="Close manual completion">&times;</button>
+      </header>
+      <form id="completeForm" class="completion-body">
+        <p id="completeIntro" class="info-lead"></p>
+        <div id="completeFields" class="completion-fields"></div>
+        <p class="completion-note">Your entry overrides an unavailable feed or extracted value. The engine will rerun all 65 methods and refresh the triangulated value. Check the requested units carefully.</p>
+        <div class="completion-actions">
+          <button id="cancelComplete" class="btn-outline" type="button">Cancel</button>
+          <button id="submitComplete" class="btn" type="submit">Enter &amp; recalculate</button>
+        </div>
+      </form>
+    </article>
+  </div>
 
   <div id="toast" class="toast hidden"></div>
 </div>

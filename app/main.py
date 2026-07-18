@@ -1,6 +1,7 @@
 """FastAPI application: wizard backend for the Securities Valuation Engine."""
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .config import UPLOAD_DIR, settings
 from .export import build_jpeg, build_pdf
@@ -66,8 +67,10 @@ class ComputeIn(BaseModel):
     market: str
     ticker: str
     date: str
-    docs: list[dict] = []
-    manual: dict = {}          # {field_key: value} manual overrides
+    docs: list[dict] = Field(default_factory=list)
+    manual: dict = Field(default_factory=dict)          # OCR/fundamental overrides
+    market_overrides: dict = Field(default_factory=dict)  # market/rate overrides
+    method_overrides: dict = Field(default_factory=dict)  # specialist external results
     use_market: bool = True
 
 
@@ -96,14 +99,39 @@ def api_compute(body: ComputeIn):
         except Exception as e:
             market = {"notes": [f"market snapshot failed: {type(e).__name__}"]}
 
+    # Explicit user entries win over external feeds. Percent entries arrive in
+    # human units (e.g. 4.35) and are normalized to decimals here; market cap is
+    # entered in millions but MarketData stores base currency units.
+    percent_keys = {"risk_free", "erp", "hist_vol", "buyback_yield", "wacc", "cost_equity"}
+    for key, raw in body.market_overrides.items():
+        value = _num(raw)
+        if value is None:
+            continue
+        if key in percent_keys:
+            value /= 100.0
+        elif key == "market_cap_m":
+            key, value = "market_cap", value * 1_000_000
+        market[key] = value
+        market.setdefault("sources", {})[key] = "manual"
+
     # Reporting currency comes from the documents; convert it into the target.
     reporting_ccy = detect_reporting_currency(docs) or target_ccy
     fx, fx_live = fx_rate(reporting_ccy, target_ccy, d)
     if fx is None:
         fx, fx_live = 1.0, False
 
+    normalized_method_overrides = {}
+    for method_id, payload in body.method_overrides.items():
+        if not isinstance(payload, dict):
+            continue
+        clean = {key: _num(payload.get(key)) for key in ("value", "intrinsic_ps")}
+        clean = {key: value for key, value in clean.items() if value is not None}
+        if clean:
+            normalized_method_overrides[str(method_id)] = clean
+
     summary = run_valuation(docs, market, currency=target_ccy,
-                            reporting_currency=reporting_ccy, fx=fx, fx_live=fx_live)
+                            reporting_currency=reporting_ccy, fx=fx, fx_live=fx_live,
+                            method_overrides=normalized_method_overrides)
     summary["market"] = market
     summary["meta"] = {
         "market": body.market, "ticker": body.ticker, "date": body.date,
@@ -117,7 +145,7 @@ def api_compute(body: ComputeIn):
 class ExportIn(BaseModel):
     format: str            # pdf | jpeg
     summary: dict
-    meta: dict = {}
+    meta: dict = Field(default_factory=dict)
 
 
 @app.post("/api/export")
@@ -141,7 +169,8 @@ def api_export(body: ExportIn):
 
 def _num(v):
     try:
-        return float(str(v).replace(",", "").strip())
+        number = float(str(v).replace(",", "").strip())
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
