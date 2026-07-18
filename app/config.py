@@ -25,8 +25,14 @@ class Settings:
     finnhub_api_key: str = field(default_factory=lambda: os.getenv("FINNHUB_API_KEY", "").strip())
     fred_api_key: str = field(default_factory=lambda: os.getenv("FRED_API_KEY", "").strip())
     eodhd_api_key: str = field(default_factory=lambda: os.getenv("EODHD_API_KEY", "").strip())
+    allowed_origins: str = field(default_factory=lambda: os.getenv(
+        "ALLOWED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").strip())
     host: str = field(default_factory=lambda: os.getenv("HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8000")))
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip().rstrip("/") for origin in self.allowed_origins.split(",") if origin.strip()]
 
     def status(self) -> dict[str, bool]:
         """Which optional keys are present (never exposes the value)."""

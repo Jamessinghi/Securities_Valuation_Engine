@@ -275,6 +275,36 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 
 Then open http://127.0.0.1:8000.
 
+## Hosted deployment: GitHub Pages + Render
+
+The production deployment is intentionally split because GitHub Pages serves
+static files and cannot execute the Python/FastAPI calculation engine.
+
+- Frontend: `https://jamessinghi.github.io/Securities_Valuation_Engine/`
+- Backend: `https://jamessinghi-securities-valuation-engine.onrender.com`
+- Health check: `https://jamessinghi-securities-valuation-engine.onrender.com/health`
+
+The workflow at `.github/workflows/deploy-pages.yml` publishes `app/static/`
+after relevant pushes to `main`. Static assets use relative URLs so the site
+works under the repository subpath. `config.js` uses same-origin API calls
+locally and switches to the Render origin only on `github.io`.
+
+The root `render.yaml` defines a free Python web service, health check,
+auto-deployment and CORS allow-list. To create it:
+
+1. Open `https://dashboard.render.com/blueprints` and create a Blueprint from
+   `https://github.com/Jamessinghi/Securities_Valuation_Engine`.
+2. Render detects `render.yaml`. Supply `FINNHUB_API_KEY` and `FRED_API_KEY` in
+   its secret prompts; `EODHD_API_KEY` remains optional.
+3. Confirm the proposed service name
+   `jamessinghi-securities-valuation-engine`, then deploy.
+4. Check `/health` returns `{"status":"ok",...}` before using the Pages site.
+
+Secrets exist only in Render's environment. They are never embedded in the
+GitHub Pages JavaScript. The backend accepts browser requests only from
+`https://jamessinghi.github.io` in production. Render free services can spin
+down when idle, so the first request after inactivity may take longer.
+
 ## Tests & linting
 
 ```bash

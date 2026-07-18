@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -21,8 +22,21 @@ from .valuation import run_valuation
 from .valuation.engine import detect_reporting_currency
 
 app = FastAPI(title="Securities Valuation Engine", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/health")
+def health():
+    """Render health check; deliberately excludes secrets and provider calls."""
+    return {"status": "ok", "service": "securities-valuation-engine"}
 
 
 @app.get("/api/config")

@@ -9,6 +9,8 @@ const S = {
   summary: null,
   completingMethod: null,
 };
+const API_BASE = (window.SVE_API_BASE || "").replace(/\/$/, "");
+const apiUrl = (path) => `${API_BASE}${path}`;
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
@@ -116,7 +118,7 @@ completeForm.addEventListener("submit", async (e) => {
 });
 
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  const r = await fetch(apiUrl(path), opts);
   if (!r.ok) { const t = await r.text(); throw new Error(t || r.status); }
   return r.json();
 }
@@ -340,7 +342,7 @@ $$("#exportMenu button").forEach((b) => b.addEventListener("click", async () => 
   if (!S.summary) return;
   $("#exportMenu").classList.add("hidden");
   toast("Preparing " + b.dataset.fmt.toUpperCase() + "…");
-  const r = await fetch("/api/export", {
+  const r = await fetch(apiUrl("/api/export"), {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ format: b.dataset.fmt, summary: S.summary, meta: S.summary.meta }),
   });

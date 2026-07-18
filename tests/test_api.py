@@ -1,4 +1,4 @@
-from app.main import ComputeIn, api_compute
+from app.main import ComputeIn, api_compute, health
 
 
 def test_compute_normalizes_manual_rate_overrides_and_reruns_capm():
@@ -30,3 +30,7 @@ def test_compute_accepts_specialist_method_override():
     precedent = next(result for result in response["results"] if result["id"] == 23)
     assert precedent["status"] == "ok"
     assert precedent["intrinsic_ps"] == 6.4
+
+
+def test_health_check_is_provider_independent():
+    assert health() == {"status": "ok", "service": "securities-valuation-engine"}
